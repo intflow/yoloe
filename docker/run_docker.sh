@@ -1,7 +1,7 @@
 #!/bin/bash
 
 container_name="yoloe"
-docker_image="ultralytics/ultralytics:latest"
+docker_image="intflow/yoloe:v0.0.0.1"
 
 # xhost +
 
