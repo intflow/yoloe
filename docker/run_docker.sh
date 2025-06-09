@@ -1,0 +1,17 @@
+#!/bin/bash
+
+container_name="yoloe"
+docker_image="ultralytics/ultralytics:latest"
+
+# xhost +
+
+sudo docker run \
+--name=${container_name} \
+--net=host \
+--privileged \
+--ipc=host \
+--gpus all \
+-w /works \
+-v /home/intflow/works:/works \
+-v /DL_data_super_hdd:/DL_data_super_hdd \
+-it ${docker_image} /bin/bash
