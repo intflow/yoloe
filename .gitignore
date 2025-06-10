@@ -174,3 +174,5 @@ ignore
 exports
 pretrain
 videos/
+
+output/

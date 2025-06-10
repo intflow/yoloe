@@ -33,16 +33,16 @@ from tracker.boostTrack.boost_track import BoostTrack
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/works/yoloe/videos/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
                         help="Input video path")
-    parser.add_argument("--output", type=str, default=None,
+    parser.add_argument("--output", type=str, default="./output",
                         help="Output directory (optional, defaults to input filename without extension)")
     # Logging
     parser.add_argument("--log-detections", type=bool, default=True,
                         help="Log detection results to label.txt")
     # Model
     parser.add_argument("--checkpoint", type=str,
-                        default="/works/yoloe/pretrain/yoloe-11l-seg.pt",
+                        default="yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
                         default=["fish", "disco ball", "pig"],
