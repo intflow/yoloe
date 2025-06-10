@@ -28,7 +28,7 @@ from ultralytics.models.yolo.yoloe.predict_vp import YOLOEVPSegPredictor
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/Heungchuk_videos/day.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
                         default="/works/samsung_prj/pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
-                        default=["fish", "disco ball", "pig"],
+                        default=["cow", "cattle"],
                         help="Custom class names list (index order matters)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
                         default=None,
                         help="Counting line end   (norm. x y, 0~1)")
     # Snapshot
-    parser.add_argument("--cross-vp", type=bool, default=False,
+    parser.add_argument("--cross-vp", type=bool, default=True,
                         help="Enable cross visual prompt mode")
     parser.add_argument("--save-interval", type=int, default=1,
                         help="Interval for saving intermediate frames")
