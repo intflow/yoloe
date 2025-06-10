@@ -156,20 +156,25 @@ class BoostTrack(object):
         else:
             self.ecc = None
 
-    def update(self, result, img_numpy, tag):
+    def update(self, objects_or_result, img_numpy, tag):
         """
         Params:
-          result - a numpy array of detections in the format [[x1,y1,x2,y2,score,class],[x1,y1,x2,y2,score,class],...]
+          objects_or_result - ObjectMeta 리스트 또는 기존 result (호환성 유지)
         Returns:
-          numpy array of shape [N,7] containing [x1,y1,x2,y2,score,class,track_id]
+          ObjectMeta 리스트 (track_id가 부여된)
         """
-        if result is None:
+        # ObjectMeta 리스트인지 확인
+        if isinstance(objects_or_result, list) and len(objects_or_result) > 0 and hasattr(objects_or_result[0], 'box'):
+            return self._update_with_objects(objects_or_result, img_numpy, tag)
+        
+        # 기존 방식 (호환성 유지)
+        if objects_or_result is None:
             return np.empty((0, 7))
 
         self.frame_count += 1
 
         # Convert to numpy array
-        dets = result.data.cpu().numpy()
+        dets = objects_or_result.data.cpu().numpy()
 
         if self.ecc is not None:
             transform = self.ecc(img_numpy, self.frame_count, tag)
@@ -265,6 +270,129 @@ class BoostTrack(object):
         if len(results) > 0:
             return np.concatenate(results)
         return np.empty((0, 7))
+
+    def _update_with_objects(self, objects, img_numpy, tag):
+        """
+        ObjectMeta 리스트를 받아서 tracking하고 track_id를 부여하여 반환
+        """
+        if not objects:
+            return []
+
+        self.frame_count += 1
+
+        # ObjectMeta를 numpy 배열로 변환
+        dets = []
+        for obj in objects:
+            x1, y1, x2, y2 = obj.box  # xyxy 형태
+            det = [x1, y1, x2, y2, obj.confidence, obj.class_id]
+            dets.append(det)
+        dets = np.array(dets)
+
+        if self.ecc is not None:
+            transform = self.ecc(img_numpy, self.frame_count, tag)
+            for trk in self.trackers:
+                trk.camera_update(transform)
+
+        # Group detections by class
+        unique_classes = np.unique(dets[:, 5])
+        tracked_objects = []
+
+        for cls in unique_classes:
+            # Get detections for current class
+            cls_mask = dets[:, 5] == cls
+            cls_dets = dets[cls_mask]
+            cls_objects = [obj for i, obj in enumerate(objects) if dets[i, 5] == cls]  # 해당 클래스의 ObjectMeta들
+
+            # Get trackers for current class
+            if cls not in self.trackers_by_class:
+                self.trackers_by_class[cls] = []
+            cls_trackers = self.trackers_by_class[cls]
+
+            # get predicted locations from existing trackers
+            trks = np.zeros((len(cls_trackers), 5))
+            confs = np.zeros((len(cls_trackers), 1))
+
+            for t in range(len(trks)):
+                pos = cls_trackers[t].predict()[0]
+                confs[t] = cls_trackers[t].get_confidence()
+                trks[t] = [pos[0], pos[1], pos[2], pos[3], confs[t, 0]]
+
+            if self.use_dlo_boost:
+                cls_dets = self.dlo_confidence_boost(cls_dets, self.use_rich_s, self.use_sb, self.use_vt)
+
+            if self.use_duo_boost:
+                cls_dets = self.duo_confidence_boost(cls_dets)
+
+            remain_inds = cls_dets[:, 4] >= self.det_thresh
+            cls_dets = cls_dets[remain_inds]
+            cls_objects = [cls_objects[i] for i, keep in enumerate(remain_inds) if keep]
+            scores = cls_dets[:, 4]
+
+            # Generate embeddings
+            dets_embs = np.ones((cls_dets.shape[0], 1))
+            emb_cost = None
+            if self.embedder and cls_dets.size > 0:
+                dets_embs = self.embedder.compute_embedding(img_numpy, cls_dets[:, :4], tag)
+                trk_embs = []
+                for t in range(len(cls_trackers)):
+                    trk_embs.append(cls_trackers[t].get_emb())
+                trk_embs = np.array(trk_embs)
+                if trk_embs.size > 0 and cls_dets.size > 0:
+                    emb_cost = dets_embs.reshape(dets_embs.shape[0], -1) @ trk_embs.reshape((trk_embs.shape[0], -1)).T
+            emb_cost = None if self.embedder is None else emb_cost
+
+            matched, unmatched_dets, unmatched_trks, sym_matrix = associate(
+                cls_dets,
+                trks,
+                self.iou_threshold,
+                mahalanobis_distance=self.get_mh_dist_matrix(cls_dets),
+                track_confidence=confs,
+                detection_confidence=scores,
+                emb_cost=emb_cost,
+                lambda_iou=self.lambda_iou,
+                lambda_mhd=self.lambda_mhd,
+                lambda_shape=self.lambda_shape
+            )
+
+            trust = (cls_dets[:, 4] - self.det_thresh) / (1 - self.det_thresh)
+            af = 0.95
+            dets_alpha = af + (1 - af) * (1 - trust)
+
+            # 매칭된 detection들에 track_id 부여
+            for m in matched:
+                det_idx, trk_idx = m[0], m[1]
+                cls_trackers[trk_idx].update(cls_dets[det_idx, :], scores[det_idx])
+                cls_trackers[trk_idx].update_emb(dets_embs[det_idx], alpha=dets_alpha[det_idx])
+                
+                # ObjectMeta에 track_id 부여
+                cls_objects[det_idx].track_id = cls_trackers[trk_idx].id + 1
+
+            # 매칭되지 않은 detection들에 새로운 tracker 생성
+            for i in unmatched_dets:
+                if cls_dets[i, 4] >= self.det_thresh:
+                    new_tracker = KalmanBoxTracker(cls_dets[i, :], emb=dets_embs[i])
+                    cls_trackers.append(new_tracker)
+                    # ObjectMeta에 새로운 track_id 부여
+                    cls_objects[i].track_id = new_tracker.id + 1
+
+            # 활성 tracker들에 해당하는 ObjectMeta만 결과에 추가
+            for i, obj in enumerate(cls_objects):
+                if obj.track_id is not None:
+                    # tracker 상태 확인
+                    for trk in cls_trackers:
+                        if trk.id + 1 == obj.track_id:
+                            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                                tracked_objects.append(obj)
+                            break
+
+            # Remove dead trackers
+            i = len(cls_trackers)
+            for trk in reversed(cls_trackers):
+                if trk.time_since_update > self.max_age:
+                    cls_trackers.pop(i-1)
+                i -= 1
+
+        return tracked_objects
 
     def dump_cache(self):
         if self.ecc is not None:
