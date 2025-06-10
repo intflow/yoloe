@@ -125,9 +125,9 @@ class KalmanBoxTracker(object):
 
 class BoostTrack(object):
     def __init__(self, video_name: Optional[str] = None):
-
         self.frame_count = 0
         self.trackers: List[KalmanBoxTracker] = []
+        self.trackers_by_class = {}  # Dictionary to store trackers by class
 
         self.max_age = GeneralSettings.max_age(video_name)
         self.iou_threshold = GeneralSettings['iou_threshold']
@@ -156,103 +156,115 @@ class BoostTrack(object):
         else:
             self.ecc = None
 
-    def update(self, dets, img_tensor, img_numpy, tag):
+    def update(self, result, img_numpy, tag):
         """
         Params:
-          dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...]
-        Requires: this method must be called once for each frame even with empty detections (use np.empty((0, 5)) for frames without detections).
-        Returns the a similar array, where the last column is the object ID.
-        NOTE: The number of objects returned may differ from the number of detections provided.
+          result - a numpy array of detections in the format [[x1,y1,x2,y2,score,class],[x1,y1,x2,y2,score,class],...]
+        Returns:
+          numpy array of shape [N,7] containing [x1,y1,x2,y2,score,class,track_id]
         """
-        if dets is None:
-            return np.empty((0, 5))
-        if not isinstance(dets, np.ndarray):
-            dets = dets.cpu().detach().numpy()
+        if result is None:
+            return np.empty((0, 7))
 
         self.frame_count += 1
 
-        # Rescale
-        scale = min(img_tensor.shape[2] / img_numpy.shape[0], img_tensor.shape[3] / img_numpy.shape[1])
-        dets = deepcopy(dets)
-        dets[:, :4] /= scale
+        # Convert to numpy array
+        dets = result.data.cpu().numpy()
 
         if self.ecc is not None:
             transform = self.ecc(img_numpy, self.frame_count, tag)
             for trk in self.trackers:
                 trk.camera_update(transform)
 
-        # get predicted locations from existing trackers.
-        trks = np.zeros((len(self.trackers), 5))
-        confs = np.zeros((len(self.trackers), 1))
+        # Group detections by class
+        unique_classes = np.unique(dets[:, 5])
+        results = []
 
-        for t in range(len(trks)):
-            pos = self.trackers[t].predict()[0]
-            confs[t] = self.trackers[t].get_confidence()
-            trks[t] = [pos[0], pos[1], pos[2], pos[3], confs[t, 0]]
+        for cls in unique_classes:
+            # Get detections for current class
+            cls_mask = dets[:, 5] == cls
+            cls_dets = dets[cls_mask]
 
-        if self.use_dlo_boost:
-            dets = self.dlo_confidence_boost(dets, self.use_rich_s, self.use_sb, self.use_vt)
+            # Get trackers for current class
+            if cls not in self.trackers_by_class:
+                self.trackers_by_class[cls] = []
+            cls_trackers = self.trackers_by_class[cls]
 
-        if self.use_duo_boost:
-            dets = self.duo_confidence_boost(dets)
+            # get predicted locations from existing trackers
+            trks = np.zeros((len(cls_trackers), 5))
+            confs = np.zeros((len(cls_trackers), 1))
 
-        remain_inds = dets[:, 4] >= self.det_thresh
-        dets = dets[remain_inds]
-        scores = dets[:, 4]
+            for t in range(len(trks)):
+                pos = cls_trackers[t].predict()[0]
+                confs[t] = cls_trackers[t].get_confidence()
+                trks[t] = [pos[0], pos[1], pos[2], pos[3], confs[t, 0]]
 
-        # Generate embeddings
-        dets_embs = np.ones((dets.shape[0], 1))
-        emb_cost = None
-        if self.embedder and dets.size > 0:
-            dets_embs = self.embedder.compute_embedding(img_numpy, dets[:, :4], tag)
-            trk_embs = []
-            for t in range(len(self.trackers)):
-                trk_embs.append(self.trackers[t].get_emb())
-            trk_embs = np.array(trk_embs)
-            if trk_embs.size > 0 and dets.size > 0:
-                emb_cost = dets_embs.reshape(dets_embs.shape[0], -1) @ trk_embs.reshape((trk_embs.shape[0], -1)).T
-        emb_cost = None if self.embedder is None else emb_cost
+            if self.use_dlo_boost:
+                cls_dets = self.dlo_confidence_boost(cls_dets, self.use_rich_s, self.use_sb, self.use_vt)
 
-        matched, unmatched_dets, unmatched_trks, sym_matrix = associate(
-            dets,
-            trks,
-            self.iou_threshold,
-            mahalanobis_distance=self.get_mh_dist_matrix(dets),
-            track_confidence=confs,
-            detection_confidence=scores,
-            emb_cost=emb_cost,
-            lambda_iou=self.lambda_iou,
-            lambda_mhd=self.lambda_mhd,
-            lambda_shape=self.lambda_shape
-        )
+            if self.use_duo_boost:
+                cls_dets = self.duo_confidence_boost(cls_dets)
 
-        trust = (dets[:, 4] - self.det_thresh) / (1 - self.det_thresh)
-        af = 0.95
-        dets_alpha = af + (1 - af) * (1 - trust)
+            remain_inds = cls_dets[:, 4] >= self.det_thresh
+            cls_dets = cls_dets[remain_inds]
+            scores = cls_dets[:, 4]
 
-        for m in matched:
-            self.trackers[m[1]].update(dets[m[0], :], scores[m[0]])
-            self.trackers[m[1]].update_emb(dets_embs[m[0]], alpha=dets_alpha[m[0]])
+            # Generate embeddings
+            dets_embs = np.ones((cls_dets.shape[0], 1))
+            emb_cost = None
+            if self.embedder and cls_dets.size > 0:
+                dets_embs = self.embedder.compute_embedding(img_numpy, cls_dets[:, :4], tag)
+                trk_embs = []
+                for t in range(len(cls_trackers)):
+                    trk_embs.append(cls_trackers[t].get_emb())
+                trk_embs = np.array(trk_embs)
+                if trk_embs.size > 0 and cls_dets.size > 0:
+                    emb_cost = dets_embs.reshape(dets_embs.shape[0], -1) @ trk_embs.reshape((trk_embs.shape[0], -1)).T
+            emb_cost = None if self.embedder is None else emb_cost
 
-        for i in unmatched_dets:
-            if dets[i, 4] >= self.det_thresh:
-                self.trackers.append(KalmanBoxTracker(dets[i, :], emb=dets_embs[i]))
+            matched, unmatched_dets, unmatched_trks, sym_matrix = associate(
+                cls_dets,
+                trks,
+                self.iou_threshold,
+                mahalanobis_distance=self.get_mh_dist_matrix(cls_dets),
+                track_confidence=confs,
+                detection_confidence=scores,
+                emb_cost=emb_cost,
+                lambda_iou=self.lambda_iou,
+                lambda_mhd=self.lambda_mhd,
+                lambda_shape=self.lambda_shape
+            )
 
-        ret = []
-        i = len(self.trackers)
-        for trk in reversed(self.trackers):
-            d = trk.get_state()[0]
-            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
-                # +1 as MOT benchmark requires positive
-                ret.append(np.concatenate((d, [trk.id + 1], [trk.get_confidence()])).reshape(1, -1))
-            i -= 1
-            # remove dead tracklet
-            if trk.time_since_update > self.max_age:
-                self.trackers.pop(i)
+            trust = (cls_dets[:, 4] - self.det_thresh) / (1 - self.det_thresh)
+            af = 0.95
+            dets_alpha = af + (1 - af) * (1 - trust)
 
-        if len(ret) > 0:
-            return np.concatenate(ret)
-        return np.empty((0, 5))
+            for m in matched:
+                cls_trackers[m[1]].update(cls_dets[m[0], :], scores[m[0]])
+                cls_trackers[m[1]].update_emb(dets_embs[m[0]], alpha=dets_alpha[m[0]])
+
+            for i in unmatched_dets:
+                if cls_dets[i, 4] >= self.det_thresh:
+                    cls_trackers.append(KalmanBoxTracker(cls_dets[i, :], emb=dets_embs[i]))
+
+            # Update results for current class
+            for trk in cls_trackers:
+                d = trk.get_state()[0]
+                if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                    # Include confidence score and class in output
+                    results.append(np.concatenate((d, [trk.get_confidence()], [cls], [trk.id + 1])).reshape(1, -1))
+
+            # Remove dead trackers
+            i = len(cls_trackers)
+            for trk in reversed(cls_trackers):
+                if trk.time_since_update > self.max_age:
+                    cls_trackers.pop(i-1)
+                i -= 1
+
+        # Combine results from all classes
+        if len(results) > 0:
+            return np.concatenate(results)
+        return np.empty((0, 7))
 
     def dump_cache(self):
         if self.ecc is not None:

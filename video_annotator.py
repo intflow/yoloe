@@ -22,6 +22,7 @@ from tqdm import tqdm
 import supervision as sv
 from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe.predict_vp import YOLOEVPSegPredictor
+import torch
 
 # ────────────────────────────── Tracker ──────────────────────────────────── #
 from tracker.boostTrack.GBI import GBInterpolation
@@ -351,18 +352,24 @@ def main() -> None:
         # Convert results to supervision format
         detections = sv.Detections.from_ultralytics(result)
         
-        # Add tracker_id to detections if available
-        if result.boxes.id is not None:
-            track_ids = result.boxes.id.cpu().numpy().astype(int)
-            unique_ids = np.unique(track_ids)
-            id_map = {old_id: new_id for new_id, old_id in enumerate(unique_ids)}
-            detections.tracker_id = np.array([id_map[tid] for tid in track_ids])
-        else:
-            detections.tracker_id = np.array([0] * len(detections))
+        targets = tracker.update(result.boxes, result.orig_img, "None")
 
-        boxes_xywh = result.boxes.xywh.cpu().numpy() if len(detections) else np.empty((0, 4))
-        class_ids  = result.boxes.cls.cpu().numpy().astype(int) if len(detections) else np.empty(0, int)
-        track_ids  = detections.tracker_id
+        # # Add tracker_id to detections if available
+        # if result.boxes.id is not None:
+        #     track_ids = result.boxes.id.cpu().numpy().astype(int)
+        #     unique_ids = np.unique(track_ids)
+        #     id_map = {old_id: new_id for new_id, old_id in enumerate(unique_ids)}
+        #     detections.tracker_id = np.array([id_map[tid] for tid in track_ids])
+        # else:
+        #     detections.tracker_id = np.array([0] * len(detections))
+
+        # boxes_xywh = result.boxes.xywh.cpu().numpy() if len(detections) else np.empty((0, 4))
+        # class_ids  = result.boxes.cls.cpu().numpy().astype(int) if len(detections) else np.empty(0, int)
+        # track_ids  = detections.tracker_id
+        
+        boxes_xywh = targets[:, :4] if len(targets) > 0 else np.empty((0, 4))
+        class_ids = targets[:, 5].astype(int) if len(targets) > 0 else np.empty(0, int)
+        track_ids = targets[:, 6].astype(int) if len(targets) > 0 else np.empty(0, int)
 
         # 로그 파일에 검출 정보 기록
         if log_file is not None:
