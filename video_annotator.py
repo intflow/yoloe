@@ -23,12 +23,16 @@ import supervision as sv
 from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe.predict_vp import YOLOEVPSegPredictor
 
+# ────────────────────────────── Tracker ──────────────────────────────────── #
+from tracker.boostTrack.GBI import GBInterpolation
+from tracker.boostTrack.boost_track import BoostTrack
+
 
 # ────────────────────────────── CLI ──────────────────────────────────── #
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="/works/yoloe/videos/efg_cargil2025_test1.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -37,7 +41,7 @@ def parse_args() -> argparse.Namespace:
                         help="Log detection results to label.txt")
     # Model
     parser.add_argument("--checkpoint", type=str,
-                        default="/works/samsung_prj/pretrain/yoloe-11l-seg.pt",
+                        default="/works/yoloe/pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
                         default=["fish", "disco ball", "pig"],
@@ -190,6 +194,9 @@ def main() -> None:
 
     person_class_id = args.names.index("fish") if "fish" in args.names else 0
     palette = sv.ColorPalette.DEFAULT
+    
+    # ─────────────── Tracker ─────────── #
+    tracker = BoostTrack(args.source)
 
     # ─────────────── Counting line (pixel) ───── #
     if args.line_start is not None and args.line_end is not None:
