@@ -161,7 +161,7 @@ def draw_box(image, box, track_id, class_id, color_palette):
     return image
 
 def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
-    """마스크 그리기"""
+    """Supervision 방식의 마스크 그리기"""
     if mask is None:
         return image
     
@@ -170,13 +170,17 @@ def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
     # 마스크를 이미지 크기로 리사이즈
     if mask.shape[:2] != image.shape[:2]:
         mask = cv2.resize(mask.astype(np.uint8), (image.shape[1], image.shape[0]))
+        mask = mask.astype(bool)  # boolean 타입으로 변환
+    else:
+        mask = mask > 0.5  # boolean 마스크로 변환
     
-    # 컬러 마스크 생성
-    colored_mask = np.zeros_like(image)
-    colored_mask[mask > 0.5] = color
+    # Supervision 방식: colored_mask 생성 후 addWeighted 사용
+    colored_mask = np.array(image, copy=True, dtype=np.uint8)
+    colored_mask[mask] = color  # 마스크 영역에만 색상 적용
     
-    # 블렌딩
-    image = cv2.addWeighted(image, 1-opacity, colored_mask, opacity, 0)
+    # addWeighted로 블렌딩 (원본 이미지에 직접 적용)
+    cv2.addWeighted(colored_mask, opacity, image, 1 - opacity, 0, dst=image)
+    
     return image
 
 def draw_label(image, box, track_id, class_name, confidence, color_palette):
@@ -204,16 +208,33 @@ def draw_label(image, box, track_id, class_name, confidence, color_palette):
     return image
 
 def draw_objects_overlay(image, objects, color_palette):
-    """모든 개체의 overlay 그리기"""
-    for obj in objects:
-        if obj.track_id is None:
-            continue
-            
-        # 박스 그리기
-        image = draw_box(image, obj.box, obj.track_id, obj.class_id, color_palette)
-        
+    """모든 개체의 overlay 그리기 (Supervision 방식: 큰 객체부터 작은 객체 순)"""
+    # area 계산하여 큰 것부터 정렬 (Supervision과 동일)
+    valid_objects = [obj for obj in objects if obj.track_id is not None]
+    
+    if not valid_objects:
+        return image
+    
+    # 박스 area 계산
+    areas = []
+    for obj in valid_objects:
+        x1, y1, x2, y2 = obj.box
+        area = (x2 - x1) * (y2 - y1)
+        areas.append(area)
+    
+    # area 기준으로 큰 것부터 정렬 (flip으로 내림차순)
+    sorted_indices = np.flip(np.argsort(areas))
+    
+    # 마스크부터 먼저 그리기 (supervision 방식)
+    for idx in sorted_indices:
+        obj = valid_objects[idx]
         # 마스크 그리기
         image = draw_mask(image, obj.mask, obj.track_id, obj.class_id, color_palette)
+    
+    # 그 다음 박스와 라벨 그리기 (원래 순서대로)
+    for obj in valid_objects:
+        # 박스 그리기
+        image = draw_box(image, obj.box, obj.track_id, obj.class_id, color_palette)
         
         # 라벨 그리기
         image = draw_label(image, obj.box, obj.track_id, obj.class_name, 
