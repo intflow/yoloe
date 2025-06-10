@@ -122,7 +122,7 @@ def point_side(p, a, b) -> int:
 # ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
 def convert_results_to_objects(result, class_names) -> list[ObjectMeta]:
     """
-    YOLO 결과를 ObjectMeta 리스트로 변환
+    YOLO 결과를 ObjectMeta 리스트로 변환 (Supervision 방식의 마스크 처리)
     """
     objects = []
     
@@ -133,10 +133,64 @@ def convert_results_to_objects(result, class_names) -> list[ObjectMeta]:
     confidences = result.boxes.conf.cpu().numpy()
     class_ids = result.boxes.cls.cpu().numpy().astype(int)
     
-    # 마스크 정보 (있을 경우)
+    # 마스크 정보 (있을 경우) - 정교한 변환 로직 사용
     masks = None
     if hasattr(result, 'masks') and result.masks is not None:
-        masks = result.masks.data.cpu().numpy()  # [N, H, W]
+        try:
+            # Supervision 방식: masks.xy 사용 (이미 원본 좌표계로 변환됨)
+            if hasattr(result.masks, 'xy') and result.masks.xy is not None:
+                # masks.xy는 이미 원본 이미지 좌표계로 변환된 polygon 좌표들
+                orig_height, orig_width = result.orig_shape
+                masks_list = []
+                
+                for mask_coords in result.masks.xy:
+                    # polygon을 마스크로 변환
+                    mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
+                    if len(mask_coords) > 0:
+                        # polygon 좌표를 integer로 변환
+                        coords = mask_coords.astype(np.int32)
+                        # fillPoly로 마스크 생성
+                        cv2.fillPoly(mask, [coords], 1)
+                    masks_list.append(mask)
+                
+                masks = np.array(masks_list)
+                
+            # xy가 없으면 data를 사용하되 더 정교한 변환 적용
+            elif hasattr(result.masks, 'data'):
+                orig_height, orig_width = result.orig_shape
+                mask_data = result.masks.data.cpu().numpy()  # [N, H, W]
+                
+                # YOLO의 이미지 전처리 정보 계산
+                input_height, input_width = mask_data.shape[1], mask_data.shape[2]
+                
+                # aspect ratio 계산
+                scale = min(input_width / orig_width, input_height / orig_height)
+                scaled_width = int(orig_width * scale)
+                scaled_height = int(orig_height * scale)
+                
+                # 패딩 계산
+                pad_x = (input_width - scaled_width) // 2
+                pad_y = (input_height - scaled_height) // 2
+                
+                masks_list = []
+                for mask in mask_data:
+                    # 패딩 제거
+                    if pad_y > 0 and pad_x > 0:
+                        mask = mask[pad_y:pad_y + scaled_height, pad_x:pad_x + scaled_width]
+                    
+                    # 원본 크기로 리사이즈
+                    resized_mask = cv2.resize(
+                        mask.astype(np.float32), 
+                        (orig_width, orig_height), 
+                        interpolation=cv2.INTER_LINEAR  # 더 부드러운 보간
+                    )
+                    masks_list.append(resized_mask)
+                
+                masks = np.array(masks_list)
+                
+        except Exception as e:
+            print(f"⚠️ 마스크 변환 오류: {e}")
+            masks = None
     
     for i in range(len(boxes)):
         obj = ObjectMeta(
@@ -161,18 +215,35 @@ def draw_box(image, box, track_id, class_id, color_palette):
     return image
 
 def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
-    """Supervision 방식의 마스크 그리기"""
+    """Supervision 방식의 마스크 그리기 (정교한 크기 변환 적용)"""
     if mask is None:
         return image
     
     color = color_palette.by_idx(track_id).as_bgr()
     
-    # 마스크를 이미지 크기로 리사이즈
+    # 마스크 크기 검증 및 상세 디버깅
     if mask.shape[:2] != image.shape[:2]:
-        mask = cv2.resize(mask.astype(np.uint8), (image.shape[1], image.shape[0]))
-        mask = mask.astype(bool)  # boolean 타입으로 변환
-    else:
-        mask = mask > 0.5  # boolean 마스크로 변환
+        print(f"🔍 마스크 크기 디버깅:")
+        print(f"   Image: {image.shape[:2]} (H, W)")
+        print(f"   Mask:  {mask.shape[:2]} (H, W)")
+        print(f"   Track: {track_id}, Class: {class_id}")
+        
+        # 정확한 리사이즈
+        mask = cv2.resize(
+            mask.astype(np.float32), 
+            (image.shape[1], image.shape[0]),  # (width, height) 순서 주의
+            interpolation=cv2.INTER_LINEAR
+        )
+        print(f"   Resized: {mask.shape[:2]}")
+    
+    # boolean 마스크로 변환 (threshold 조정)
+    mask = mask > 0.3  # threshold를 낮춰서 더 많은 영역 포함
+    
+    # 마스크 영역이 있는지 확인
+    mask_area = np.sum(mask)
+    if mask_area == 0:
+        print(f"⚠️ 빈 마스크: track_id={track_id}")
+        return image
     
     # Supervision 방식: colored_mask 생성 후 addWeighted 사용
     colored_mask = np.array(image, copy=True, dtype=np.uint8)
