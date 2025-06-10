@@ -14,4 +14,5 @@ sudo docker run \
 -w /works \
 -v /home/intflow/works:/works \
 -v /DL_data_super_hdd:/DL_data_super_hdd \
+-v /DL_data_super_ssd:/DL_data_super_ssd \
 -it ${docker_image} /bin/bash

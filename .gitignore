@@ -173,3 +173,6 @@ calibration_*.npy
 ignore
 exports
 pretrain
+
+test_images/
+output/
