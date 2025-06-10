@@ -79,6 +79,10 @@ def parse_args() -> argparse.Namespace:
                         help="Detection NMS IoU threshold")
     parser.add_argument("--track-history", type=int, default=100,
                         help="Frames kept in trajectory history")
+    parser.add_argument("--track-det-thresh", type=float, default=0.1,
+                        help="Detection confidence threshold for tracking")
+    parser.add_argument("--track-iou-thresh", type=float, default=0.3,
+                        help="Tracking IoU threshold")
     # Congestion / counting
     parser.add_argument("--max-people", type=int, default=100,
                         help="People count that corresponds to 100 % congestion")
@@ -411,7 +415,11 @@ def main() -> None:
     palette = sv.ColorPalette.DEFAULT
     
     # ─────────────── Tracker ─────────── #
-    tracker = BoostTrack(args.source)
+    tracker = BoostTrack(
+        video_name=args.source,
+        det_thresh=args.track_det_thresh,
+        iou_threshold=args.track_iou_thresh
+    )
 
     # ─────────────── Counting line (pixel) ───── #
     if args.line_start is not None and args.line_end is not None:

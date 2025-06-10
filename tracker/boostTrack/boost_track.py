@@ -124,14 +124,15 @@ class KalmanBoxTracker(object):
 
 
 class BoostTrack(object):
-    def __init__(self, video_name: Optional[str] = None):
+    def __init__(self, video_name: Optional[str] = None, det_thresh: Optional[float] = None, iou_threshold: Optional[float] = None):
         self.frame_count = 0
         self.trackers: List[KalmanBoxTracker] = []
         self.trackers_by_class = {}  # Dictionary to store trackers by class
 
         self.max_age = GeneralSettings.max_age(video_name)
-        self.iou_threshold = GeneralSettings['iou_threshold']
-        self.det_thresh = GeneralSettings['det_thresh']
+        # CLI 파라미터가 있으면 사용, 없으면 기본값 사용
+        self.iou_threshold = iou_threshold if iou_threshold is not None else GeneralSettings['iou_threshold']
+        self.det_thresh = det_thresh if det_thresh is not None else GeneralSettings['det_thresh']
         self.min_hits = GeneralSettings['min_hits']
 
         self.lambda_iou = BoostTrackSettings['lambda_iou']
