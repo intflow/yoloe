@@ -102,6 +102,8 @@ def parse_args() -> argparse.Namespace:
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
+    parser.add_argument("--vpe-momentum", type=float, default=0.1,
+                        help="VPE moving average momentum")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
                         help="Image sharpening factor (0.0-1.0)")
@@ -941,7 +943,7 @@ def main() -> None:
                     print(f"🎯 첫 번째 VPE 설정 완료")
                 else:
                     # VPE Moving Average (momentum=0.7)
-                    momentum = 0.7
+                    momentum = args.vpe_momentum
                     prev_vpe = momentum * prev_vpe + (1 - momentum) * current_vpe
                     print(f"🔄 VPE Moving Average 업데이트 완료 (momentum={momentum})")
             else:
