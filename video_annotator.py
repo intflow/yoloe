@@ -98,8 +98,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=1,
                         help="Interval for saving intermediate frames")
     # Batch processing
-    parser.add_argument("--batch-size", type=int, default=4,
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for inference processing")
+    parser.add_argument("--frame-loading-threads", type=int, default=32,
+                        help="Number of threads for frame loading")
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
                         help="Image sharpening factor (0.0-1.0)")
@@ -323,26 +325,80 @@ def draw_objects_overlay(image, objects, color_palette):
 
 # ─────────────────────── Batch Processing Functions ────────────────────────────── #
 def load_batch_frames(cap, start_frame, end_frame, args):
-    """지정된 범위의 프레임들을 batch로 로드"""
+    """지정된 범위의 프레임들을 멀티스레딩으로 배치 로드"""
+    import concurrent.futures
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    
+    batch_size = end_frame - start_frame
+    print(f"   📂 프레임 {start_frame}-{end_frame-1} 로딩 중... (배치 크기: {batch_size}, 스레드: {min(args.frame_loading_threads, batch_size)}개)")
+    
+    # 스레드 세이프한 프레임 데이터 저장
+    frame_data = {}
+    lock = threading.Lock()
+    
+    def load_single_frame(frame_idx):
+        """단일 프레임 로딩 (스레드에서 실행)"""
+        try:
+            # 각 스레드마다 별도의 VideoCapture 사용 (스레드 세이프)
+            thread_cap = cv2.VideoCapture(args.source)
+            thread_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame_bgr = thread_cap.read()
+            thread_cap.release()
+            
+            if ok:
+                # RGB 변환 및 전처리
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = preprocess_image(frame_rgb, args)
+                
+                # PIL Image로 변환
+                pil_frame = Image.fromarray(frame_rgb)
+                
+                # 스레드 세이프하게 저장
+                with lock:
+                    frame_data[frame_idx] = {
+                        'pil_frame': pil_frame,
+                        'original_frame': frame_bgr.copy(),
+                        'success': True
+                    }
+                    
+                    # 진행 상황 출력 (10% 단위)
+                    loaded_count = len(frame_data)
+                    if loaded_count % max(1, batch_size // 10) == 0:
+                        progress = (loaded_count / batch_size) * 100
+                        print(f"     📊 프레임 로딩 진행률: {progress:.0f}% ({loaded_count}/{batch_size})")
+            else:
+                with lock:
+                    frame_data[frame_idx] = {'success': False}
+                    
+        except Exception as e:
+            with lock:
+                frame_data[frame_idx] = {'success': False, 'error': str(e)}
+    
+    # 멀티스레딩으로 프레임 로딩 (사용자 설정 스레드 수 사용)
+    max_workers = min(args.frame_loading_threads, batch_size)  # 배치 크기보다 많은 스레드는 불필요
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 모든 프레임 인덱스에 대해 병렬 처리
+        frame_indices = list(range(start_frame, end_frame))
+        futures = [executor.submit(load_single_frame, idx) for idx in frame_indices]
+        
+        # 모든 스레드 완료 대기
+        concurrent.futures.wait(futures)
+    
+    # 결과 정리 (인덱스 순서대로)
     batch_frames = []
     batch_indices = []
     batch_original_frames = []
     
+    loaded_count = 0
     for frame_idx in range(start_frame, end_frame):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame_bgr = cap.read()
-        
-        if ok:
-            # 원본 프레임 저장 (시각화용)
-            batch_original_frames.append(frame_bgr.copy())
-            
-            # RGB 변환 및 전처리
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_rgb = preprocess_image(frame_rgb, args)  # 기존 전처리 유지
-            
-            # PIL Image로 변환 (YOLO 입력 형식)
-            batch_frames.append(Image.fromarray(frame_rgb))
+        if frame_idx in frame_data and frame_data[frame_idx]['success']:
+            batch_frames.append(frame_data[frame_idx]['pil_frame'])
             batch_indices.append(frame_idx)
+            batch_original_frames.append(frame_data[frame_idx]['original_frame'])
+            loaded_count += 1
+    
+    print(f"   ✅ 프레임 로딩 완료: {loaded_count}/{batch_size} 성공 ({(loaded_count/batch_size)*100:.1f}%)")
     
     return batch_frames, batch_indices, batch_original_frames
 
@@ -350,7 +406,11 @@ def load_batch_frames(cap, start_frame, end_frame, args):
 def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
     """Batch 단위로 inference 수행"""
     
+    batch_size = len(batch_frames)
+    print(f"   🧠 배치 추론 시작: {batch_size}개 프레임 처리")
+    
     if prev_vpe is not None and args.cross_vp:
+        print(f"   🎯 VPE 모드로 추론 중...")
         # 이전 batch의 VPE를 현재 batch에 적용
         model_vp.set_classes(args.names, prev_vpe)
         model_vp.predictor = None
@@ -363,7 +423,9 @@ def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
             iou=args.iou_thresh,
             verbose=False
         )
+        print(f"   ✅ VPE 추론 완료: {len(results)}개 결과 생성")
     else:
+        print(f"   🔍 기본 모드로 추론 중...")
         # 첫 번째 batch 또는 VPE 없이 처리
         results = model.predict(
             source=batch_frames,
@@ -372,6 +434,7 @@ def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
             iou=args.iou_thresh,
             verbose=False
         )
+        print(f"   ✅ 기본 추론 완료: {len(results)}개 결과 생성")
     
     return results
 
