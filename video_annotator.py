@@ -400,9 +400,16 @@ def update_batch_vpe(batch_results, model_vp, args):
                     "frame": result.orig_img,  # 원본 이미지 정보
                     "frame_idx": i
                 }
+                
+                # 모든 클래스가 포함되도록 추가
+                for cls_idx in range(len(args.names)):
+                    if cls_idx not in class_ids:
+                        prompt_data["bboxes"] = np.append(prompt_data["bboxes"], [[0, 0, 0, 0]], axis=0)
+                        prompt_data["cls"] = np.append(prompt_data["cls"], [cls_idx])                
+                        
                 high_conf_prompts.append(prompt_data)
                 print(f"   프레임 {i}: {len(boxes[high_conf_mask])} 개의 high-conf detection 수집")
-    
+                
     if high_conf_prompts:
         print(f"✅ 총 {len(high_conf_prompts)} 프레임에서 프롬프트 수집 완료")
         # Batch 내 프롬프트들로 VPE 생성
