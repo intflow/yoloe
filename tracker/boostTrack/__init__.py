@@ -1,0 +1,3 @@
+"""
+BoostTrack package initialization
+""" 

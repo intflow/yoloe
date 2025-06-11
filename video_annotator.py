@@ -22,22 +22,46 @@ from tqdm import tqdm
 import supervision as sv
 from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe.predict_vp import YOLOEVPSegPredictor
+import torch
+
+# ────────────────────────────── Tracker ──────────────────────────────────── #
+from tracker.boostTrack.GBI import GBInterpolation
+from tracker.boostTrack.boost_track import BoostTrack
+
+
+# ────────────────────────────── ObjectMeta Class ──────────────────────────── #
+class ObjectMeta:
+    """
+    개체의 모든 메타데이터를 담는 클래스
+    Detection부터 Tracking, Overlay까지 일관되게 사용
+    """
+    def __init__(self, box=None, mask=None, confidence=None, class_id=None, 
+                 class_name=None, track_id=None):
+        self.box = box              # [x1, y1, x2, y2] or [cx, cy, w, h]
+        self.mask = mask            # segmentation mask array
+        self.confidence = confidence # detection confidence score
+        self.class_id = class_id    # class index
+        self.class_name = class_name # class name string
+        self.track_id = track_id    # tracking ID (None initially)
+    
+    def __repr__(self):
+        return f"ObjectMeta(class={self.class_name}, track_id={self.track_id}, conf={self.confidence:.2f})"
 
 
 # ────────────────────────────── CLI ──────────────────────────────────── #
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/Heungchuk_videos/night_bad.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/Heungchuk_videos/day.mp4",
                         help="Input video path")
-    parser.add_argument("--output", type=str, default="/works/yoloe/output",
+    parser.add_argument("--output", type=str, default=None,
                         help="Output directory (optional, defaults to input filename without extension)")
     # Logging
     parser.add_argument("--log-detections", type=bool, default=True,
                         help="Log detection results to label.txt")
     # Model
     parser.add_argument("--checkpoint", type=str,
-                        default="pretrain/yoloe-11l-seg.pt",
+                        default="/works/samsung_prj/pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
                         default=["cow", "cattle"],
@@ -55,6 +79,10 @@ def parse_args() -> argparse.Namespace:
                         help="Detection NMS IoU threshold")
     parser.add_argument("--track-history", type=int, default=100,
                         help="Frames kept in trajectory history")
+    parser.add_argument("--track-det-thresh", type=float, default=0.1,
+                        help="Detection confidence threshold for tracking")
+    parser.add_argument("--track-iou-thresh", type=float, default=0.3,
+                        help="Tracking IoU threshold")
     # Congestion / counting
     parser.add_argument("--max-people", type=int, default=100,
                         help="People count that corresponds to 100 % congestion")
@@ -93,6 +121,201 @@ def point_side(p, a, b) -> int:
     x2, y2 = b
     val = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
     return 0 if val == 0 else (1 if val > 0 else -1)
+
+
+# ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
+def convert_results_to_objects(result, class_names) -> list[ObjectMeta]:
+    """
+    YOLO 결과를 ObjectMeta 리스트로 변환 (Supervision 방식의 마스크 처리)
+    """
+    objects = []
+    
+    if len(result.boxes) == 0:
+        return objects
+    
+    boxes = result.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
+    confidences = result.boxes.conf.cpu().numpy()
+    class_ids = result.boxes.cls.cpu().numpy().astype(int)
+    
+    # 마스크 정보 (있을 경우) - 정교한 변환 로직 사용
+    masks = None
+    if hasattr(result, 'masks') and result.masks is not None:
+        try:
+            # Supervision 방식: masks.xy 사용 (이미 원본 좌표계로 변환됨)
+            if hasattr(result.masks, 'xy') and result.masks.xy is not None:
+                # masks.xy는 이미 원본 이미지 좌표계로 변환된 polygon 좌표들
+                orig_height, orig_width = result.orig_shape
+                masks_list = []
+                
+                for mask_coords in result.masks.xy:
+                    # polygon을 마스크로 변환
+                    mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
+                    if len(mask_coords) > 0:
+                        # polygon 좌표를 integer로 변환
+                        coords = mask_coords.astype(np.int32)
+                        # fillPoly로 마스크 생성
+                        cv2.fillPoly(mask, [coords], 1)
+                    masks_list.append(mask)
+                
+                masks = np.array(masks_list)
+                
+            # xy가 없으면 data를 사용하되 더 정교한 변환 적용
+            elif hasattr(result.masks, 'data'):
+                orig_height, orig_width = result.orig_shape
+                mask_data = result.masks.data.cpu().numpy()  # [N, H, W]
+                
+                # YOLO의 이미지 전처리 정보 계산
+                input_height, input_width = mask_data.shape[1], mask_data.shape[2]
+                
+                # aspect ratio 계산
+                scale = min(input_width / orig_width, input_height / orig_height)
+                scaled_width = int(orig_width * scale)
+                scaled_height = int(orig_height * scale)
+                
+                # 패딩 계산
+                pad_x = (input_width - scaled_width) // 2
+                pad_y = (input_height - scaled_height) // 2
+                
+                masks_list = []
+                for mask in mask_data:
+                    # 패딩 제거
+                    if pad_y > 0 and pad_x > 0:
+                        mask = mask[pad_y:pad_y + scaled_height, pad_x:pad_x + scaled_width]
+                    
+                    # 원본 크기로 리사이즈
+                    resized_mask = cv2.resize(
+                        mask.astype(np.float32), 
+                        (orig_width, orig_height), 
+                        interpolation=cv2.INTER_LINEAR  # 더 부드러운 보간
+                    )
+                    masks_list.append(resized_mask)
+                
+                masks = np.array(masks_list)
+                
+        except Exception as e:
+            print(f"⚠️ 마스크 변환 오류: {e}")
+            masks = None
+    
+    for i in range(len(boxes)):
+        obj = ObjectMeta(
+            box=boxes[i],
+            mask=masks[i] if masks is not None else None,
+            confidence=confidences[i],
+            class_id=class_ids[i],
+            class_name=class_names[class_ids[i]],
+            track_id=None  # 트래커에서 부여받을 예정
+        )
+        objects.append(obj)
+    
+    return objects
+
+
+# ─────────────────────── Direct Overlay Functions ────────────────────────────── #
+def draw_box(image, box, track_id, class_id, color_palette):
+    """박스 그리기"""
+    x1, y1, x2, y2 = map(int, box)
+    color = color_palette.by_idx(track_id).as_bgr()
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+    return image
+
+def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
+    """Supervision 방식의 마스크 그리기 (정교한 크기 변환 적용)"""
+    if mask is None:
+        return image
+    
+    color = color_palette.by_idx(track_id).as_bgr()
+    
+    # 마스크 크기 검증 및 상세 디버깅
+    if mask.shape[:2] != image.shape[:2]:
+        print(f"🔍 마스크 크기 디버깅:")
+        print(f"   Image: {image.shape[:2]} (H, W)")
+        print(f"   Mask:  {mask.shape[:2]} (H, W)")
+        print(f"   Track: {track_id}, Class: {class_id}")
+        
+        # 정확한 리사이즈
+        mask = cv2.resize(
+            mask.astype(np.float32), 
+            (image.shape[1], image.shape[0]),  # (width, height) 순서 주의
+            interpolation=cv2.INTER_LINEAR
+        )
+        print(f"   Resized: {mask.shape[:2]}")
+    
+    # boolean 마스크로 변환 (threshold 조정)
+    mask = mask > 0.3  # threshold를 낮춰서 더 많은 영역 포함
+    
+    # 마스크 영역이 있는지 확인
+    mask_area = np.sum(mask)
+    if mask_area == 0:
+        print(f"⚠️ 빈 마스크: track_id={track_id}")
+        return image
+    
+    # Supervision 방식: colored_mask 생성 후 addWeighted 사용
+    colored_mask = np.array(image, copy=True, dtype=np.uint8)
+    colored_mask[mask] = color  # 마스크 영역에만 색상 적용
+    
+    # addWeighted로 블렌딩 (원본 이미지에 직접 적용)
+    cv2.addWeighted(colored_mask, opacity, image, 1 - opacity, 0, dst=image)
+    
+    return image
+
+def draw_label(image, box, track_id, class_name, confidence, color_palette):
+    """라벨 그리기"""
+    x1, y1, x2, y2 = map(int, box)
+    color = color_palette.by_idx(track_id).as_bgr()
+    
+    # 라벨 텍스트
+    label = f"{class_name} {track_id} {confidence:.2f}"
+    
+    # 텍스트 크기 계산
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    thickness = 2
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+    
+    # 라벨 배경 그리기
+    cv2.rectangle(image, (x1, y1 - text_h - baseline - 10), 
+                  (x1 + text_w, y1), color, -1)
+    
+    # 텍스트 그리기
+    cv2.putText(image, label, (x1, y1 - baseline - 5), 
+                font, font_scale, (255, 255, 255), thickness)
+    
+    return image
+
+def draw_objects_overlay(image, objects, color_palette):
+    """모든 개체의 overlay 그리기 (Supervision 방식: 큰 객체부터 작은 객체 순)"""
+    # area 계산하여 큰 것부터 정렬 (Supervision과 동일)
+    valid_objects = [obj for obj in objects if obj.track_id is not None]
+    
+    if not valid_objects:
+        return image
+    
+    # 박스 area 계산
+    areas = []
+    for obj in valid_objects:
+        x1, y1, x2, y2 = obj.box
+        area = (x2 - x1) * (y2 - y1)
+        areas.append(area)
+    
+    # area 기준으로 큰 것부터 정렬 (flip으로 내림차순)
+    sorted_indices = np.flip(np.argsort(areas))
+    
+    # 마스크부터 먼저 그리기 (supervision 방식)
+    for idx in sorted_indices:
+        obj = valid_objects[idx]
+        # 마스크 그리기
+        image = draw_mask(image, obj.mask, obj.track_id, obj.class_id, color_palette)
+    
+    # 그 다음 박스와 라벨 그리기 (원래 순서대로)
+    for obj in valid_objects:
+        # 박스 그리기
+        image = draw_box(image, obj.box, obj.track_id, obj.class_id, color_palette)
+        
+        # 라벨 그리기
+        image = draw_label(image, obj.box, obj.track_id, obj.class_name, 
+                          obj.confidence, color_palette)
+    
+    return image
 
 
 # ───────────────────────────── Main ───────────────────────────────────── #
@@ -190,6 +413,13 @@ def main() -> None:
 
     person_class_id = args.names.index("fish") if "fish" in args.names else 0
     palette = sv.ColorPalette.DEFAULT
+    
+    # ─────────────── Tracker ─────────── #
+    tracker = BoostTrack(
+        video_name=args.source,
+        det_thresh=args.track_det_thresh,
+        iou_threshold=args.track_iou_thresh
+    )
 
     # ─────────────── Counting line (pixel) ───── #
     if args.line_start is not None and args.line_end is not None:
@@ -341,21 +571,30 @@ def main() -> None:
             prev_prompt = None
             prompt_frame = None
 
-        # Convert results to supervision format
-        detections = sv.Detections.from_ultralytics(result)
+        # ── ObjectMeta 중심 처리 시작 ── #
+        # 1. Model 결과를 ObjectMeta 리스트로 변환
+        detected_objects = convert_results_to_objects(result, args.names)
         
-        # Add tracker_id to detections if available
-        if result.boxes.id is not None:
-            track_ids = result.boxes.id.cpu().numpy().astype(int)
-            unique_ids = np.unique(track_ids)
-            id_map = {old_id: new_id for new_id, old_id in enumerate(unique_ids)}
-            detections.tracker_id = np.array([id_map[tid] for tid in track_ids])
+        # 2. 새로운 ObjectMeta 기반 트래커 사용
+        tracked_objects = tracker.update(detected_objects, result.orig_img, "None")
+        
+        # 3. 기존 변수들을 ObjectMeta에서 추출 (기존 로직 호환성을 위해)
+        if tracked_objects:
+            # tracked_objects에서 xywh 형태로 변환 (기존 로직 호환)
+            boxes_xywh = []
+            for obj in tracked_objects:
+                x1, y1, x2, y2 = obj.box  # xyxy
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                w, h = x2 - x1, y2 - y1
+                boxes_xywh.append([cx, cy, w, h])
+            boxes_xywh = np.array(boxes_xywh)
+            
+            class_ids = np.array([obj.class_id for obj in tracked_objects])
+            track_ids = np.array([obj.track_id for obj in tracked_objects])
         else:
-            detections.tracker_id = np.array([0] * len(detections))
-
-        boxes_xywh = result.boxes.xywh.cpu().numpy() if len(detections) else np.empty((0, 4))
-        class_ids  = result.boxes.cls.cpu().numpy().astype(int) if len(detections) else np.empty(0, int)
-        track_ids  = detections.tracker_id
+            boxes_xywh = np.empty((0, 4))
+            class_ids = np.empty(0, int)
+            track_ids = np.empty(0, int)
 
         # 로그 파일에 검출 정보 기록
         if log_file is not None:
@@ -379,18 +618,11 @@ def main() -> None:
                         log_file.flush()
                         log_buffer.clear()
 
+        # ── 새로운 ObjectMeta 기반 Overlay 시스템 ── #
         annotated = frame_rgb.copy()
-        if len(detections):
-            mask_annot = sv.MaskAnnotator(color_lookup=sv.ColorLookup.CLASS, opacity=0.4)
-            label_annot = sv.LabelAnnotator(color_lookup=sv.ColorLookup.CLASS,
-                                         smart_position=True,
-                                         text_scale=sv.calculate_optimal_text_scale(resolution_wh=image_pil.size))
-            annotated = mask_annot.annotate(annotated, detections)
-            box_annot = sv.BoxAnnotator(color_lookup=sv.ColorLookup.CLASS)
-            annotated = box_annot.annotate(annotated, detections)
-            annotated = label_annot.annotate(annotated, detections,
-                                          labels=[f"{n} {c:.2f}" for n, c in zip(detections['class_name'],
-                                                                                 detections.confidence)])
+        if tracked_objects:
+            # 직접 구현한 overlay 함수 사용
+            annotated = draw_objects_overlay(annotated, tracked_objects, palette)
 
         # ── People occupancy - 1초마다 갱신
         raw_occupancy = int(np.sum(class_ids == person_class_id))
@@ -402,11 +634,17 @@ def main() -> None:
 
         line_crossed_this_frame = False
 
-        for (cx, cy, w, h), cid, tid in zip(boxes_xywh, class_ids, track_ids):
-            if tid == -1 or cid != person_class_id:
+        # ── ObjectMeta 기반 히트맵 및 라인 크로싱 처리 ── #
+        for obj in tracked_objects:
+            if obj.track_id == -1 or obj.class_id != person_class_id:
                 continue
 
+            # 박스 중심점 계산 (xyxy → center)
+            x1, y1, x2, y2 = obj.box
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
             ix, iy = int(cx), int(cy)
+            
+            # 히트맵 업데이트
             if 0 <= iy < height and 0 <= ix < width:
                 radius = 10
                 for dy in range(-radius, radius + 1):
@@ -417,15 +655,17 @@ def main() -> None:
                                 intensity = 1.0 * (1.0 - ((dx*dx + dy*dy) / (radius*radius)))
                                 heatmap[ny, nx] += intensity
 
-            if tid not in track_color:
-                track_color[tid] = palette.by_idx(tid).as_bgr()
+            # 트래킹 컬러 설정
+            if obj.track_id not in track_color:
+                track_color[obj.track_id] = palette.by_idx(obj.track_id).as_bgr()
 
+            # 라인 크로싱 체크
             if p1 is not None and p2 is not None:
                 side_now = point_side((cx, cy), p1, p2)
                 t = ((cx - p1[0]) * seg_dx + (cy - p1[1]) * seg_dy) / seg_len2
                 inside = 0.0 <= t <= 1.0
 
-                side_prev = track_side.get(tid, side_now)
+                side_prev = track_side.get(obj.track_id, side_now)
                 if inside and (side_prev * side_now < 0):
                     line_crossed_this_frame = True
                     if side_prev < 0 < side_now:
@@ -433,7 +673,7 @@ def main() -> None:
                     elif side_prev > 0 > side_now:
                         backward_cnt += 1
                 if inside and side_now != 0:
-                    track_side[tid] = side_now
+                    track_side[obj.track_id] = side_now
 
         if p1 is not None and p2 is not None:
             if line_crossed_this_frame:

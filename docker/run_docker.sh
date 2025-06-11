@@ -1,6 +1,6 @@
 #!/bin/bash
 
-container_name="yoloe"
+container_name="yoloe_display"
 docker_image="intflow/yoloe:v0.0.0.1"
 
 # xhost +
@@ -11,6 +11,9 @@ sudo docker run \
 --privileged \
 --ipc=host \
 --gpus all \
+-e DISPLAY=$DISPLAY \
+-v /tmp/.X11-unix:/tmp/.X11-unix \
+-v /home/$USER/.Xauthority:/root/.Xauthority:rw \
 -w /works \
 -v /home/intflow/works:/works \
 -v /DL_data_super_hdd:/DL_data_super_hdd \

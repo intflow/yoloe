@@ -175,4 +175,6 @@ exports
 pretrain
 
 test_images/
+videos/
+
 output/
