@@ -421,58 +421,63 @@ def update_batch_vpe(batch_results, model_vp, args):
 
 
 def generate_batch_vpe(prompts_list, model_vp, args):
-    """여러 프롬프트에서 VPE 생성 후 평균화"""
-    vpe_list = []
+    """여러 프롬프트에서 VPE를 배치로 생성 후 평균화"""
     
-    print(f"🧠 {len(prompts_list)} 개 프롬프트에서 VPE 생성 중...")
+    print(f"🧠 {len(prompts_list)} 개 프롬프트에서 배치 VPE 생성 중...")
+    
+    # 배치용 이미지와 프롬프트 준비
+    batch_images = []
+    batch_prompts = {"bboxes": [], "cls": []}
     
     for i, prompt_data in enumerate(prompts_list):
-        try:
-            # 각 프롬프트에서 VPE 생성
-            print(f"   VPE {i+1}/{len(prompts_list)} 생성 중...")
+        # 이미지 준비
+        frame_rgb = cv2.cvtColor(prompt_data["frame"], cv2.COLOR_BGR2RGB)
+        batch_images.append(Image.fromarray(frame_rgb))
+        
+        # 프롬프트 준비
+        batch_prompts["bboxes"].append(prompt_data["bboxes"])
+        batch_prompts["cls"].append(prompt_data["cls"])
+    
+    try:
+        # 배치 VPE 생성 (한 번의 호출로 모든 프롬프트 처리)
+        print(f"   📦 {len(batch_images)} 개 이미지를 배치로 VPE 생성 중...")
+        
+        model_vp.predictor = None  # VPE 생성 전 초기화
+        model_vp.predict(
+            source=batch_images,  # ← 배치 이미지 리스트
+            prompts=batch_prompts,  # ← 배치 프롬프트
+            predictor=YOLOEVPSegPredictor,
+            return_vpe=True,
+            imgsz=args.image_size,
+            conf=args.vp_thresh,
+            iou=args.iou_thresh,
+            verbose=False
+        )
+        
+        # VPE 추출
+        if hasattr(model_vp, 'predictor') and hasattr(model_vp.predictor, 'vpe'):
+            batch_vpe = model_vp.predictor.vpe
+            print(f"     ✅ 배치 VPE 생성 성공 (shape: {batch_vpe.shape})")
             
-            # 프롬프트 형식 준비 (기존 코드와 동일한 형식)
-            prompts = {
-                "bboxes": [prompt_data["bboxes"]],
-                "cls": [prompt_data["cls"]]
-            }
-            
-            # YOLOE VP 예측기로 VPE 생성 (기존 방식과 동일)
-            model_vp.predictor = None  # ← 핵심! VPE 생성 전 초기화
-            model_vp.predict(
-                source=Image.fromarray(cv2.cvtColor(prompt_data["frame"], cv2.COLOR_BGR2RGB)),
-                prompts=prompts,
-                predictor=YOLOEVPSegPredictor,
-                return_vpe=True,
-                imgsz=args.image_size,
-                conf=args.vp_thresh,
-                iou=args.iou_thresh,
-                verbose=False
-            )
-            
-            # VPE 추출
-            if hasattr(model_vp, 'predictor') and hasattr(model_vp.predictor, 'vpe'):
-                current_vpe = model_vp.predictor.vpe
-                vpe_list.append(current_vpe)
-                print(f"     ✅ VPE {i+1} 생성 성공 (shape: {current_vpe.shape})")
+            # 배치 차원을 평균화하여 단일 VPE로 변환
+            if len(batch_vpe.shape) > 2:  # (batch_size, classes, features) 형태인 경우
+                averaged_vpe = batch_vpe.mean(dim=0, keepdim=True)  # (1, classes, features)
+                print(f"     🔄 배치 VPE 평균화: {batch_vpe.shape} → {averaged_vpe.shape}")
             else:
-                print(f"     ❌ VPE {i+1} 생성 실패 - predictor 또는 vpe 속성 없음")
-                
+                averaged_vpe = batch_vpe
+            
             # 예측기 정리
             model_vp.predictor = None
             
-        except Exception as e:
-            print(f"     ❌ VPE {i+1} 생성 중 오류: {e}")
-            continue
-    
-    if vpe_list:
-        # VPE들의 평균 계산
-        print(f"🔄 {len(vpe_list)} 개 VPE 평균화 중...")
-        avg_vpe = torch.stack(vpe_list).mean(dim=0)
-        print(f"✅ Batch VPE 평균화 완료 (최종 shape: {avg_vpe.shape})")
-        return avg_vpe
-    else:
-        print("❌ 생성된 VPE가 없음")
+            return averaged_vpe
+        else:
+            print(f"     ❌ 배치 VPE 생성 실패 - predictor 또는 vpe 속성 없음")
+            model_vp.predictor = None
+            return None
+            
+    except Exception as e:
+        print(f"     ❌ 배치 VPE 생성 중 오류: {e}")
+        model_vp.predictor = None
         return None
 
 
