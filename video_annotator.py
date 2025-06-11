@@ -52,9 +52,9 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/Heungchuk_videos/day.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
                         help="Input video path")
-    parser.add_argument("--output", type=str, default=None,
+    parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
     # Logging
     parser.add_argument("--log-detections", type=bool, default=True,
@@ -97,6 +97,9 @@ def parse_args() -> argparse.Namespace:
                         help="Enable cross visual prompt mode")
     parser.add_argument("--save-interval", type=int, default=1,
                         help="Interval for saving intermediate frames")
+    # Batch processing
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Batch size for inference processing")
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
                         help="Image sharpening factor (0.0-1.0)")
@@ -318,6 +321,350 @@ def draw_objects_overlay(image, objects, color_palette):
     return image
 
 
+# ─────────────────────── Batch Processing Functions ────────────────────────────── #
+def load_batch_frames(cap, start_frame, end_frame, args):
+    """지정된 범위의 프레임들을 batch로 로드"""
+    batch_frames = []
+    batch_indices = []
+    batch_original_frames = []
+    
+    for frame_idx in range(start_frame, end_frame):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame_bgr = cap.read()
+        
+        if ok:
+            # 원본 프레임 저장 (시각화용)
+            batch_original_frames.append(frame_bgr.copy())
+            
+            # RGB 변환 및 전처리
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb = preprocess_image(frame_rgb, args)  # 기존 전처리 유지
+            
+            # PIL Image로 변환 (YOLO 입력 형식)
+            batch_frames.append(Image.fromarray(frame_rgb))
+            batch_indices.append(frame_idx)
+    
+    return batch_frames, batch_indices, batch_original_frames
+
+
+def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
+    """Batch 단위로 inference 수행"""
+    
+    if prev_vpe is not None and args.cross_vp:
+        # 이전 batch의 VPE를 현재 batch에 적용
+        model_vp.set_classes(args.names, prev_vpe)
+        
+        # Batch inference with VPE
+        results = model_vp.predict(
+            source=batch_frames,  # 리스트로 전달하면 batch 처리됨
+            imgsz=args.image_size,
+            conf=args.conf_thresh,
+            iou=args.iou_thresh,
+            verbose=False
+        )
+    else:
+        # 첫 번째 batch 또는 VPE 없이 처리
+        results = model.predict(
+            source=batch_frames,
+            imgsz=args.image_size,
+            conf=0.05,
+            iou=args.iou_thresh,
+            verbose=False
+        )
+    
+    return results
+
+
+def update_batch_vpe(batch_results, model_vp, args):
+    """Batch 결과에서 VPE 생성 및 평균화"""
+    
+    high_conf_prompts = []
+    
+    print(f"🔍 VPE 생성을 위한 high-confidence detection 수집 중...")
+    
+    # Batch 내 모든 프레임에서 high-confidence detection 수집
+    for i, result in enumerate(batch_results):
+        if len(result.boxes) > 0:
+            confidences = result.boxes.conf.cpu().numpy()
+            boxes = result.boxes.xyxy.cpu().numpy()
+            class_ids = result.boxes.cls.cpu().numpy()
+            
+            high_conf_mask = confidences >= args.vp_thresh
+            
+            if np.any(high_conf_mask):
+                # High confidence detection을 프롬프트로 사용
+                prompt_data = {
+                    "bboxes": boxes[high_conf_mask],
+                    "cls": class_ids[high_conf_mask],
+                    "frame": result.orig_img,  # 원본 이미지 정보
+                    "frame_idx": i
+                }
+                high_conf_prompts.append(prompt_data)
+                print(f"   프레임 {i}: {len(boxes[high_conf_mask])} 개의 high-conf detection 수집")
+    
+    if high_conf_prompts:
+        print(f"✅ 총 {len(high_conf_prompts)} 프레임에서 프롬프트 수집 완료")
+        # Batch 내 프롬프트들로 VPE 생성
+        batch_vpe = generate_batch_vpe(high_conf_prompts, model_vp, args)
+        return batch_vpe
+    else:
+        print("⚠️ High-confidence detection이 없어 VPE 생성 불가")
+        return None
+
+
+def generate_batch_vpe(prompts_list, model_vp, args):
+    """여러 프롬프트에서 VPE 생성 후 평균화"""
+    vpe_list = []
+    
+    print(f"🧠 {len(prompts_list)} 개 프롬프트에서 VPE 생성 중...")
+    
+    for i, prompt_data in enumerate(prompts_list):
+        try:
+            # 각 프롬프트에서 VPE 생성
+            print(f"   VPE {i+1}/{len(prompts_list)} 생성 중...")
+            
+            # YOLOE VP 예측기 설정
+            model_vp.predictor = YOLOEVPSegPredictor
+            temp_result = model_vp.predict(
+                source=Image.fromarray(cv2.cvtColor(prompt_data["frame"], cv2.COLOR_BGR2RGB)),
+                imgsz=args.image_size,
+                conf=args.vp_thresh,
+                iou=args.iou_thresh,
+                return_vpe=True,
+                prompts={
+                    "bboxes": [prompt_data["bboxes"]],
+                    "cls": [prompt_data["cls"]]
+                },
+                predictor=YOLOEVPSegPredictor,
+                verbose=False
+            )
+            
+            # VPE 추출
+            if hasattr(model_vp, 'predictor') and hasattr(model_vp.predictor, 'vpe'):
+                current_vpe = model_vp.predictor.vpe
+                vpe_list.append(current_vpe)
+                print(f"     ✅ VPE {i+1} 생성 성공 (shape: {current_vpe.shape})")
+            else:
+                print(f"     ❌ VPE {i+1} 생성 실패")
+                
+            # 예측기 정리
+            model_vp.predictor = None
+            
+        except Exception as e:
+            print(f"     ❌ VPE {i+1} 생성 중 오류: {e}")
+            continue
+    
+    if vpe_list:
+        # VPE들의 평균 계산
+        print(f"🔄 {len(vpe_list)} 개 VPE 평균화 중...")
+        avg_vpe = torch.stack(vpe_list).mean(dim=0)
+        print(f"✅ Batch VPE 평균화 완료 (최종 shape: {avg_vpe.shape})")
+        return avg_vpe
+    else:
+        print("❌ 생성된 VPE가 없음")
+        return None
+
+
+def process_batch_results(batch_results, batch_indices, batch_original_frames, 
+                         tracker, args, fps, palette, person_class_id,
+                         # 상태 변수들
+                         track_history, track_side, track_color, 
+                         forward_cnt, backward_cnt, current_occupancy, current_congestion,
+                         last_update_time, heatmap, last_save_frame, log_buffer,
+                         # I/O 관련
+                         output_dir, out, log_file,
+                         # 라인 크로싱 관련
+                         p1, p2, seg_dx, seg_dy, seg_len2,
+                         width, height):
+    """Batch 결과를 개별 프레임으로 처리"""
+    
+    updated_state = {
+        'forward_cnt': forward_cnt,
+        'backward_cnt': backward_cnt,
+        'current_occupancy': current_occupancy,
+        'current_congestion': current_congestion,
+        'last_update_time': last_update_time,
+        'last_save_frame': last_save_frame
+    }
+    
+    for result, frame_idx, original_frame in zip(batch_results, batch_indices, batch_original_frames):
+        # 시간 계산
+        current_time = frame_idx / fps
+        hours = int(current_time // 3600)
+        minutes = int((current_time % 3600) // 60)
+        seconds = int(current_time % 60)
+        milliseconds = int((current_time % 1) * 1000)
+        time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+        
+        # ObjectMeta 변환
+        detected_objects = convert_results_to_objects(result, args.names)
+        
+        # Tracker 업데이트 (기존 로직 유지)
+        tracked_objects = tracker.update(detected_objects, result.orig_img, "None")
+        
+        # 기존 변수들 추출 (호환성 유지)
+        if tracked_objects:
+            boxes_xywh = []
+            for obj in tracked_objects:
+                x1, y1, x2, y2 = obj.box  # xyxy
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                w, h = x2 - x1, y2 - y1
+                boxes_xywh.append([cx, cy, w, h])
+            boxes_xywh = np.array(boxes_xywh)
+            
+            class_ids = np.array([obj.class_id for obj in tracked_objects])
+            track_ids = np.array([obj.track_id for obj in tracked_objects])
+        else:
+            boxes_xywh = np.empty((0, 4))
+            class_ids = np.empty(0, int)
+            track_ids = np.empty(0, int)
+
+        # 로깅 처리
+        if log_file is not None:
+            class_counts = defaultdict(int)
+            for cid in class_ids:
+                class_counts[cid] += 1
+
+            print(f"Frame {frame_idx} - Class counts:")
+            for cid, count in class_counts.items():
+                print(f"  {args.names[cid]}: {count}")
+
+            for cid, tid in zip(class_ids, track_ids):
+                class_name = args.names[cid]
+                class_count = class_counts[cid]
+                log_entry = f"{time_str},{class_name},{tid},{class_count}\n"
+                log_buffer.append(log_entry)
+                if len(log_buffer) >= 100:
+                    log_file.writelines(log_buffer)
+                    log_file.flush()
+                    log_buffer.clear()
+
+        # 시각화
+        frame_rgb = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+        annotated = frame_rgb.copy()
+        if tracked_objects:
+            annotated = draw_objects_overlay(annotated, tracked_objects, palette)
+
+        # Occupancy 업데이트
+        raw_occupancy = int(np.sum(class_ids == person_class_id))
+        if current_time - updated_state['last_update_time'] >= 1.0:
+            updated_state['last_update_time'] = current_time
+            updated_state['current_occupancy'] = raw_occupancy
+            updated_state['current_congestion'] = int(min(raw_occupancy / max(args.max_people, 1), 1.0) * 100)
+
+        line_crossed_this_frame = False
+
+        # 히트맵 및 라인 크로싱 처리
+        for obj in tracked_objects:
+            if obj.track_id == -1 or obj.class_id != person_class_id:
+                continue
+
+            x1, y1, x2, y2 = obj.box
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            ix, iy = int(cx), int(cy)
+            
+            # 히트맵 업데이트
+            if 0 <= iy < height and 0 <= ix < width:
+                radius = 10
+                for dy in range(-radius, radius + 1):
+                    for dx in range(-radius, radius + 1):
+                        if dx*dx + dy*dy <= radius*radius:
+                            ny, nx = iy + dy, ix + dx
+                            if 0 <= ny < height and 0 <= nx < width:
+                                intensity = 1.0 * (1.0 - ((dx*dx + dy*dy) / (radius*radius)))
+                                heatmap[ny, nx] += intensity
+
+            # 트래킹 컬러 설정
+            if obj.track_id not in track_color:
+                track_color[obj.track_id] = palette.by_idx(obj.track_id).as_bgr()
+
+            # 라인 크로싱 체크
+            if p1 is not None and p2 is not None:
+                side_now = point_side((cx, cy), p1, p2)
+                t = ((cx - p1[0]) * seg_dx + (cy - p1[1]) * seg_dy) / seg_len2
+                inside = 0.0 <= t <= 1.0
+
+                side_prev = track_side.get(obj.track_id, side_now)
+                if inside and (side_prev * side_now < 0):
+                    line_crossed_this_frame = True
+                    if side_prev < 0 < side_now:
+                        updated_state['forward_cnt'] += 1
+                    elif side_prev > 0 > side_now:
+                        updated_state['backward_cnt'] += 1
+                if inside and side_now != 0:
+                    track_side[obj.track_id] = side_now
+
+        # 라인 그리기
+        if p1 is not None and p2 is not None:
+            if line_crossed_this_frame:
+                cv2.line(annotated, p1, p2, (255, 0, 0), 8)
+            else:
+                cv2.line(annotated, p1, p2, (255, 255, 255), 8)
+
+            mid_x, mid_y = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+            perp_x, perp_y = -dy, dx
+            length = 50
+            mag = (perp_x**2 + perp_y**2) ** 0.5 or 1
+            perp_x, perp_y = int(perp_x / mag * length), int(perp_y / mag * length)
+            arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
+            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), 8, tipLength=0.6)
+
+        # Overlay 정보 그리기
+        overlay = [
+            f"[1] Congestion : {updated_state['current_congestion']:3d} %",
+            f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
+            f"[3] Occupancy  : {updated_state['current_occupancy']}",
+            f"[4] Time      : {time_str}"
+        ]
+        x0, y0, dy = 30, 60, 50
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1
+        font_thickness = 2
+        padding = 10
+        max_width = 0
+        for txt in overlay:
+            (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
+            max_width = max(max_width, tw)
+        rect_x1, rect_y1 = x0 - padding, y0 - th - padding
+        rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
+        overlay_rect = annotated.copy()
+        cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
+        annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
+        for i, txt in enumerate(overlay):
+            cv2.putText(annotated, txt, (x0, y0 + i * dy),
+                        font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+
+        # 히트맵 minimap
+        blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
+        norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
+
+        mini_w = 400
+        mini_h = int(height * mini_w / width)
+        mini_map = cv2.resize(color_hm, (mini_w, mini_h))
+
+        margin = 20
+        x_start = width - mini_w - margin
+        y_start = margin
+        roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
+        blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
+        annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
+
+        # 중간 저장
+        if frame_idx - updated_state['last_save_frame'] >= args.save_interval:
+            snapshot_path = os.path.join(output_dir, f"intermediate_{frame_idx:06d}_{time_str.replace(':', '-')}.jpg")
+            cv2.imwrite(snapshot_path, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+            updated_state['last_save_frame'] = frame_idx
+            print(f"\n중간 저장 완료: {snapshot_path}")
+
+        # 비디오 출력
+        out.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+    
+    return updated_state
+
+
 # ───────────────────────────── Main ───────────────────────────────────── #
 def preprocess_image(image, args):
     """이미지 전처리 함수"""
@@ -398,6 +745,11 @@ def main() -> None:
 
     # Select frames to process
     frames_to_process = range(total_frames)
+    
+    # Batch 처리 설정
+    batch_size = args.batch_size
+    total_batches = (total_frames + batch_size - 1) // batch_size
+    print(f"🚀 Batch 처리 시작: {total_frames} 프레임을 {batch_size} 단위로 {total_batches} batch 처리")
 
     # ─────────────── Model & palette ─────────── #
     model = YOLOE(args.checkpoint)
@@ -475,270 +827,98 @@ def main() -> None:
                         cv2.VideoWriter_fourcc(*'mp4v'),
                         fps, (width, height))
 
-    pbar = tqdm(total=len(frames_to_process), desc="Processing")
+    pbar = tqdm(total=total_batches, desc="Processing batches")
+    
+    # VPE 상태 변수
+    prev_vpe = None
 
-    # ────────────────── Frame loop ───────────────── #
-    for frame_idx in frames_to_process:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame_bgr = cap.read()
-        if not ok:
-            break
-
-        frame_count += 1
-        current_time = frame_idx / fps  # 실제 영상의 시간 계산
-
-        # 현재 프레임 시간 계산 (시간:분:초:밀리초)
-        hours = int(current_time // 3600)
-        minutes = int((current_time % 3600) // 60)
-        seconds = int(current_time % 60)
-        milliseconds = int((current_time % 1) * 1000)
-        time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    # ────────────────── Batch loop ───────────────── #
+    for batch_idx in range(total_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, total_frames)
         
-        # 이미지 전처리 적용
-        frame_rgb = preprocess_image(frame_rgb, args)
+        print(f"\n📦 Batch {batch_idx + 1}/{total_batches}: 프레임 {batch_start}-{batch_end-1}")
         
-        image_pil = Image.fromarray(frame_rgb)
-
-        # ── Detection (track 대신 predict만 사용) ── #
-        if prev_prompt is not None and prompt_frame is not None and args.cross_vp:
-            # 이전 프롬프트로 Cross-Image VP
-            model_vp.predictor = YOLOEVPSegPredictor
-            model_vp.predictor = None
-            model_vp.predict(
-                source=prompt_frame,
-                imgsz=args.image_size,
-                conf=args.vp_thresh,
-                iou=args.iou_thresh,
-                return_vpe=True,
-                prompts=prev_prompt,
-                predictor=YOLOEVPSegPredictor
-            )
-            if hasattr(model_vp, 'predictor') and hasattr(model_vp.predictor, 'vpe'):
-                current_vpe = model_vp.predictor.vpe
-                if vpe_avg is None:
-                    vpe_avg = current_vpe
-                else:
-                    vpe_avg = vpe_alpha * vpe_avg + (1 - vpe_alpha) * current_vpe
-                model_vp.set_classes(args.names, vpe_avg)
-                model_vp.predictor = None
-            else:
-                print("[DEBUG] VPE 생성 실패!")
-
-            results = model_vp.predict(
-                source=image_pil,
-                imgsz=args.image_size,
-                conf=args.conf_thresh,
-                iou=args.iou_thresh,
-                verbose=False
-            )
-            result = results[0] if isinstance(results, list) else results
-        else:
-            results = model.predict(
-                source=image_pil,
-                imgsz=args.image_size,
-                conf=0.05,
-                iou=args.iou_thresh,
-                verbose=False
-            )
-            result = results[0] if isinstance(results, list) else results
-
-        # 1차 프롬프트 갱신
-        if len(result.boxes) > 0:
-            confidences = result.boxes.conf.cpu().numpy()
-            boxes = result.boxes.xyxy.cpu().numpy()
-            high_conf_mask = confidences >= args.vp_thresh
-            if np.any(high_conf_mask):
-                # 각 box에 해당하는 class ID 사용
-                class_ids = result.boxes.cls.cpu().numpy()[high_conf_mask]
-                prev_prompt = {
-                    "bboxes": [boxes[high_conf_mask]],
-                    "cls": [class_ids]
-                }
-                
-                # 모든 클래스가 포함되도록 추가
-                for cls_idx in range(len(args.names)):
-                    if cls_idx not in class_ids:
-                        prev_prompt["bboxes"][0] = np.append(prev_prompt["bboxes"][0], [[0, 0, 0, 0]], axis=0)
-                        prev_prompt["cls"][0] = np.append(prev_prompt["cls"][0], [cls_idx])
-                
-                prompt_frame = image_pil.copy()
-            else:
-                prev_prompt = None
-                prompt_frame = None
-        else:
-            prev_prompt = None
-            prompt_frame = None
-
-        # ── ObjectMeta 중심 처리 시작 ── #
-        # 1. Model 결과를 ObjectMeta 리스트로 변환
-        detected_objects = convert_results_to_objects(result, args.names)
+        # 1. Batch 프레임 로드
+        batch_frames, batch_indices, batch_original_frames = load_batch_frames(
+            cap, batch_start, batch_end, args)
         
-        # 2. 새로운 ObjectMeta 기반 트래커 사용
-        tracked_objects = tracker.update(detected_objects, result.orig_img, "None")
-        
-        # 3. 기존 변수들을 ObjectMeta에서 추출 (기존 로직 호환성을 위해)
-        if tracked_objects:
-            # tracked_objects에서 xywh 형태로 변환 (기존 로직 호환)
-            boxes_xywh = []
-            for obj in tracked_objects:
-                x1, y1, x2, y2 = obj.box  # xyxy
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                w, h = x2 - x1, y2 - y1
-                boxes_xywh.append([cx, cy, w, h])
-            boxes_xywh = np.array(boxes_xywh)
+        if not batch_frames:
+            print("⚠️ 빈 batch, 건너뛰기")
+            continue
             
-            class_ids = np.array([obj.class_id for obj in tracked_objects])
-            track_ids = np.array([obj.track_id for obj in tracked_objects])
-        else:
-            boxes_xywh = np.empty((0, 4))
-            class_ids = np.empty(0, int)
-            track_ids = np.empty(0, int)
-
-        # 로그 파일에 검출 정보 기록
-        if log_file is not None:
-            class_counts = defaultdict(int)
-            for cid in class_ids:
-                class_counts[cid] += 1
-
-            # 클래스별 검출 숫자 출력
-            print(f"Frame {frame_idx} - Class counts:")
-            for cid, count in class_counts.items():
-                print(f"  {args.names[cid]}: {count}")
-
-            for cid, tid in zip(class_ids, track_ids):
-                class_name = args.names[cid]
-                class_count = class_counts[cid]
-                log_entry = f"{time_str},{class_name},{tid},{class_count}\n"
-                if log_file is not None:
-                    log_buffer.append(log_entry)
-                    if len(log_buffer) >= 100:
-                        log_file.writelines(log_buffer)
-                        log_file.flush()
-                        log_buffer.clear()
-
-        # ── 새로운 ObjectMeta 기반 Overlay 시스템 ── #
-        annotated = frame_rgb.copy()
-        if tracked_objects:
-            # 직접 구현한 overlay 함수 사용
-            annotated = draw_objects_overlay(annotated, tracked_objects, palette)
-
-        # ── People occupancy - 1초마다 갱신
-        raw_occupancy = int(np.sum(class_ids == person_class_id))
-
-        if current_time - last_update_time >= 1.0:
-            last_update_time = current_time
-            current_occupancy = raw_occupancy
-            current_congestion = int(min(current_occupancy / max(args.max_people, 1), 1.0) * 100)
-
-        line_crossed_this_frame = False
-
-        # ── ObjectMeta 기반 히트맵 및 라인 크로싱 처리 ── #
-        for obj in tracked_objects:
-            if obj.track_id == -1 or obj.class_id != person_class_id:
-                continue
-
-            # 박스 중심점 계산 (xyxy → center)
-            x1, y1, x2, y2 = obj.box
-            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            ix, iy = int(cx), int(cy)
-            
-            # 히트맵 업데이트
-            if 0 <= iy < height and 0 <= ix < width:
-                radius = 10
-                for dy in range(-radius, radius + 1):
-                    for dx in range(-radius, radius + 1):
-                        if dx*dx + dy*dy <= radius*radius:
-                            ny, nx = iy + dy, ix + dx
-                            if 0 <= ny < height and 0 <= nx < width:
-                                intensity = 1.0 * (1.0 - ((dx*dx + dy*dy) / (radius*radius)))
-                                heatmap[ny, nx] += intensity
-
-            # 트래킹 컬러 설정
-            if obj.track_id not in track_color:
-                track_color[obj.track_id] = palette.by_idx(obj.track_id).as_bgr()
-
-            # 라인 크로싱 체크
-            if p1 is not None and p2 is not None:
-                side_now = point_side((cx, cy), p1, p2)
-                t = ((cx - p1[0]) * seg_dx + (cy - p1[1]) * seg_dy) / seg_len2
-                inside = 0.0 <= t <= 1.0
-
-                side_prev = track_side.get(obj.track_id, side_now)
-                if inside and (side_prev * side_now < 0):
-                    line_crossed_this_frame = True
-                    if side_prev < 0 < side_now:
-                        forward_cnt += 1
-                    elif side_prev > 0 > side_now:
-                        backward_cnt += 1
-                if inside and side_now != 0:
-                    track_side[obj.track_id] = side_now
-
-        if p1 is not None and p2 is not None:
-            if line_crossed_this_frame:
-                cv2.line(annotated, p1, p2, (255, 0, 0), 8)
+        # 2. Batch inference
+        batch_results = inference_batch(batch_frames, model, model_vp, prev_vpe, args)
+        
+        # 2.5. VPE 업데이트 (다음 batch용)
+        print(f"🔄 Batch {batch_idx + 1}에서 다음 batch용 VPE 생성 중...")
+        current_vpe = update_batch_vpe(batch_results, model_vp, args)
+        
+        if current_vpe is not None:
+            if prev_vpe is None:
+                # 첫 번째 VPE
+                prev_vpe = current_vpe
+                print(f"🎯 첫 번째 VPE 설정 완료")
             else:
-                cv2.line(annotated, p1, p2, (255, 255, 255), 8)
-
-            mid_x, mid_y = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
-            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-            perp_x, perp_y = -dy, dx
-            length = 50
-            mag = (perp_x**2 + perp_y**2) ** 0.5 or 1
-            perp_x, perp_y = int(perp_x / mag * length), int(perp_y / mag * length)
-            arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
-            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), 8, tipLength=0.6)
-
-        overlay = [
-            f"[1] Congestion : {current_congestion:3d} %",
-            f"[2] Crossing   : forward {forward_cnt} | backward {backward_cnt}",
-            f"[3] Occupancy  : {current_occupancy}",
-            f"[4] Time      : {time_str}"
-        ]
-        x0, y0, dy = 30, 60, 50
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1
-        font_thickness = 2
-        padding = 10
-        max_width = 0
-        for txt in overlay:
-            (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
-            max_width = max(max_width, tw)
-        total_height = th * len(overlay) + dy * (len(overlay) - 1)
-        rect_x1, rect_y1 = x0 - padding, y0 - th - padding
-        rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
-        overlay_rect = annotated.copy()
-        cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
-        annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
-        for i, txt in enumerate(overlay):
-            cv2.putText(annotated, txt, (x0, y0 + i * dy),
-                        font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
-
-        blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
-        norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-        color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
-
-        mini_w = 400
-        mini_h = int(height * mini_w / width)
-        mini_map = cv2.resize(color_hm, (mini_w, mini_h))
-
-        margin = 20
-        x_start = width - mini_w - margin
-        y_start = margin
-        roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
-        blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
-        annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
-
-        if frame_idx - last_save_frame >= args.save_interval:
-            snapshot_path = os.path.join(output_dir, f"intermediate_{frame_idx:06d}_{time_str.replace(':', '-')}.jpg")
-            cv2.imwrite(snapshot_path, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
-            last_save_frame = frame_idx
-            print(f"\n중간 저장 완료: {snapshot_path}")
-
-        out.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                # VPE Moving Average (momentum=0.7)
+                momentum = 0.7
+                prev_vpe = momentum * prev_vpe + (1 - momentum) * current_vpe
+                print(f"🔄 VPE Moving Average 업데이트 완료 (momentum={momentum})")
+        else:
+            print(f"⚠️ Batch {batch_idx + 1}에서 VPE 생성 실패, 이전 VPE 유지")
+        
+        # 3. Batch 결과 처리 (기존 로직 유지)
+        updated_state = process_batch_results(
+            batch_results, batch_indices, batch_original_frames,
+            tracker, args, fps, palette, person_class_id,
+            # 상태 변수들
+            track_history, track_side, track_color, 
+            forward_cnt, backward_cnt, current_occupancy, current_congestion,
+            last_update_time, heatmap, last_save_frame, log_buffer,
+            # I/O 관련
+            output_dir, out, log_file,
+            # 라인 크로싱 관련
+            p1, p2, seg_dx, seg_dy, seg_len2,
+            width, height
+        )
+        
+        # 상태 변수 업데이트
+        forward_cnt = updated_state['forward_cnt']
+        backward_cnt = updated_state['backward_cnt']
+        current_occupancy = updated_state['current_occupancy'] 
+        current_congestion = updated_state['current_congestion']
+        last_update_time = updated_state['last_update_time']
+        last_save_frame = updated_state['last_save_frame']
+        
+        # Progress bar 업데이트
         pbar.update(1)
+        vpe_status = "ON" if prev_vpe is not None else "OFF"
+        pbar.set_postfix({
+            'VPE': vpe_status,
+            'occupancy': current_occupancy,
+            'congestion': f"{current_congestion}%",
+            'forward': forward_cnt,
+            'backward': backward_cnt
+        })
+        
+        print(f"✅ Batch {batch_idx + 1} 완료: {len(batch_results)} 프레임 처리")
+
+    # ────────────────── Batch 처리 완료 & 정리 ───────────────── #
+    print(f"\n🎉 모든 batch 처리 완료!")
+    print(f"📊 최종 통계:")
+    print(f"   - 총 처리된 batch: {total_batches}")
+    print(f"   - 총 처리된 프레임: {total_frames}")
+    print(f"   - VPE 상태: {'활성화' if prev_vpe is not None else '비활성화'}")
+    print(f"   - Batch 크기: {batch_size}")
+    print(f"   - 최종 occupancy: {current_occupancy}")
+    print(f"   - 최종 congestion: {current_congestion}%")
+    print(f"   - 라인 크로싱: forward {forward_cnt}, backward {backward_cnt}")
+    
+    if args.cross_vp and prev_vpe is not None:
+        print(f"🧠 VPE 정보:")
+        print(f"   - VPE shape: {prev_vpe.shape}")
+        print(f"   - VPE dtype: {prev_vpe.dtype}")
+        print(f"   - Cross-VP 모드: 활성화")
 
     pbar.close()
     cap.release()
