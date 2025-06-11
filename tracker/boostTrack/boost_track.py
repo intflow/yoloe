@@ -164,9 +164,11 @@ class BoostTrack(object):
         Returns:
           ObjectMeta 리스트 (track_id가 부여된)
         """
-        # ObjectMeta 리스트인지 확인
-        if isinstance(objects_or_result, list) and len(objects_or_result) > 0 and hasattr(objects_or_result[0], 'box'):
-            return self._update_with_objects(objects_or_result, img_numpy, tag)
+        # ObjectMeta 리스트인지 확인 (빈 리스트도 포함)
+        if isinstance(objects_or_result, list):
+            # 빈 리스트이거나 첫 번째 요소가 ObjectMeta인 경우
+            if len(objects_or_result) == 0 or hasattr(objects_or_result[0], 'box'):
+                return self._update_with_objects(objects_or_result, img_numpy, tag)
         
         # 기존 방식 (호환성 유지)
         if objects_or_result is None:
