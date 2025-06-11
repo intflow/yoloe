@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
                         default="/works/samsung_prj/pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
-                        default=["cow", "cattle"],
+                        default=["fish", "disco ball", "pig"],
                         help="Custom class names list (index order matters)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=1,
                         help="Interval for saving intermediate frames")
     # Batch processing
-    parser.add_argument("--batch-size", type=int, default=8,
+    parser.add_argument("--batch-size", type=int, default=4,
                         help="Batch size for inference processing")
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -353,6 +353,7 @@ def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
     if prev_vpe is not None and args.cross_vp:
         # 이전 batch의 VPE를 현재 batch에 적용
         model_vp.set_classes(args.names, prev_vpe)
+        model_vp.predictor = None
         
         # Batch inference with VPE
         results = model_vp.predict(
@@ -423,19 +424,22 @@ def generate_batch_vpe(prompts_list, model_vp, args):
             # 각 프롬프트에서 VPE 생성
             print(f"   VPE {i+1}/{len(prompts_list)} 생성 중...")
             
-            # YOLOE VP 예측기 설정
-            model_vp.predictor = YOLOEVPSegPredictor
-            temp_result = model_vp.predict(
+            # 프롬프트 형식 준비 (기존 코드와 동일한 형식)
+            prompts = {
+                "bboxes": [prompt_data["bboxes"]],
+                "cls": [prompt_data["cls"]]
+            }
+            
+            # YOLOE VP 예측기로 VPE 생성 (기존 방식과 동일)
+            model_vp.predictor = None  # ← 핵심! VPE 생성 전 초기화
+            model_vp.predict(
                 source=Image.fromarray(cv2.cvtColor(prompt_data["frame"], cv2.COLOR_BGR2RGB)),
+                prompts=prompts,
+                predictor=YOLOEVPSegPredictor,
+                return_vpe=True,
                 imgsz=args.image_size,
                 conf=args.vp_thresh,
                 iou=args.iou_thresh,
-                return_vpe=True,
-                prompts={
-                    "bboxes": [prompt_data["bboxes"]],
-                    "cls": [prompt_data["cls"]]
-                },
-                predictor=YOLOEVPSegPredictor,
                 verbose=False
             )
             
@@ -445,7 +449,7 @@ def generate_batch_vpe(prompts_list, model_vp, args):
                 vpe_list.append(current_vpe)
                 print(f"     ✅ VPE {i+1} 생성 성공 (shape: {current_vpe.shape})")
             else:
-                print(f"     ❌ VPE {i+1} 생성 실패")
+                print(f"     ❌ VPE {i+1} 생성 실패 - predictor 또는 vpe 속성 없음")
                 
             # 예측기 정리
             model_vp.predictor = None
@@ -850,22 +854,25 @@ def main() -> None:
         # 2. Batch inference
         batch_results = inference_batch(batch_frames, model, model_vp, prev_vpe, args)
         
-        # 2.5. VPE 업데이트 (다음 batch용)
-        print(f"🔄 Batch {batch_idx + 1}에서 다음 batch용 VPE 생성 중...")
-        current_vpe = update_batch_vpe(batch_results, model_vp, args)
-        
-        if current_vpe is not None:
-            if prev_vpe is None:
-                # 첫 번째 VPE
-                prev_vpe = current_vpe
-                print(f"🎯 첫 번째 VPE 설정 완료")
+        # 2.5. VPE 업데이트 (다음 batch용) - cross_vp 활성화시만
+        if args.cross_vp:
+            print(f"🔄 Batch {batch_idx + 1}에서 다음 batch용 VPE 생성 중...")
+            current_vpe = update_batch_vpe(batch_results, model_vp, args)
+            
+            if current_vpe is not None:
+                if prev_vpe is None:
+                    # 첫 번째 VPE
+                    prev_vpe = current_vpe
+                    print(f"🎯 첫 번째 VPE 설정 완료")
+                else:
+                    # VPE Moving Average (momentum=0.7)
+                    momentum = 0.7
+                    prev_vpe = momentum * prev_vpe + (1 - momentum) * current_vpe
+                    print(f"🔄 VPE Moving Average 업데이트 완료 (momentum={momentum})")
             else:
-                # VPE Moving Average (momentum=0.7)
-                momentum = 0.7
-                prev_vpe = momentum * prev_vpe + (1 - momentum) * current_vpe
-                print(f"🔄 VPE Moving Average 업데이트 완료 (momentum={momentum})")
+                print(f"⚠️ Batch {batch_idx + 1}에서 VPE 생성 실패, 이전 VPE 유지")
         else:
-            print(f"⚠️ Batch {batch_idx + 1}에서 VPE 생성 실패, 이전 VPE 유지")
+            print(f"🚫 Cross-VP 비활성화됨, VPE 생성 건너뛰기")
         
         # 3. Batch 결과 처리 (기존 로직 유지)
         updated_state = process_batch_results(
