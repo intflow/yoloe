@@ -57,12 +57,14 @@ class YOLODataset(BaseDataset):
 
     def __init__(self, *args, data=None, task="detect", load_vp=False, **kwargs):
         """Initializes the YOLODataset with optional configurations for segments and keypoints."""
-        self.use_segments = task == "segment"
-        self.use_keypoints = task == "pose"
-        self.use_obb = task == "obb"
+        self.use_segments = task == "segment" or task == "oadseg"
+        self.use_keypoints = task == "pose" or task == "oad" or task == "oadseg"
+        self.use_obb = task == "obb" or task == "oad" or task == "oadseg"
         self.data = data
         self.load_vp = load_vp
-        assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+        self.task = task
+        if task != "oadseg":
+            assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, **kwargs)
 
     def cache_labels(self, path=Path("./labels.cache")):
@@ -96,6 +98,7 @@ class YOLODataset(BaseDataset):
                     repeat(len(self.data["names"])),
                     repeat(nkpt),
                     repeat(ndim),
+                    repeat(self.use_obb)
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
@@ -105,18 +108,33 @@ class YOLODataset(BaseDataset):
                 ne += ne_f
                 nc += nc_f
                 if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
+                    if self.task == "oad" or self.task == "oadseg":
+                        x["labels"].append(
+                            {
+                                "im_file": im_file,
+                                "shape": shape,
+                                "cls": lb[:, 0:1],  # n, 1
+                                "bboxes": lb[:, 1:5],  # n, 4
+                                "angles": lb[:, 5:6],  # n, 1
+                                "segments": segments,
+                                "keypoints": keypoint,
+                                "normalized": True,
+                                "bbox_format": "xywh",
+                            }
+                        )
+                    else:
+                        x["labels"].append(
+                            {
+                                "im_file": im_file,
+                                "shape": shape,
+                                "cls": lb[:, 0:1],  # n, 1
+                                "bboxes": lb[:, 1:5],  # n, 4
+                                "segments": segments,
+                                "keypoints": keypoint,
+                                "normalized": True,
+                                "bbox_format": "xywh",
+                            }
+                        )
                 if msg:
                     msgs.append(msg)
                 pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
@@ -162,14 +180,14 @@ class YOLODataset(BaseDataset):
         # Check if the dataset is all boxes or all segments
         lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
         len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
-        if len_segments and len_boxes != len_segments:
-            LOGGER.warning(
-                f"WARNING ⚠️ Box and segment counts should be equal, but got len(segments) = {len_segments}, "
-                f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
-                "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
-            )
-            for lb in labels:
-                lb["segments"] = []
+        # if len_segments and len_boxes != len_segments:
+        #     LOGGER.warning(
+        #         f"WARNING ⚠️ Box and segment counts should be equal, but got len(segments) = {len_segments}, "
+        #         f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
+        #         "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
+        #     )
+        #     for lb in labels:
+        #         lb["segments"] = []
         if len_cls == 0:
             LOGGER.warning(f"WARNING ⚠️ No labels found in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
@@ -222,18 +240,97 @@ class YOLODataset(BaseDataset):
         bboxes = label.pop("bboxes")
         segments = label.pop("segments", [])
         keypoints = label.pop("keypoints", None)
+        angles = label.pop("angles", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
 
-        # NOTE: do NOT resample oriented boxes
-        segment_resamples = 100 if self.use_obb else 1000
+        # # NOTE: do NOT resample oriented boxes
+        # segment_resamples = 100 if self.use_obb else 1000
+        # if len(segments) > 0:
+        #     # list[np.array(1000, 2)] * num_samples
+        #     # (N, 1000, 2)
+        #     segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+        # else:
+        #     segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+        
+        segment_resamples = 1000
+        
+        # 세그멘테이션 데이터 처리 개선
         if len(segments) > 0:
-            # list[np.array(1000, 2)] * num_samples
-            # (N, 1000, 2)
-            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+            try:
+                # 세그멘트 형식 검증 및 필터링
+                valid_segments = []
+                for seg in segments:
+                    # 세그멘트가 유효한지 확인
+                    if isinstance(seg, np.ndarray) and seg.size >= 4:  # 최소 2개의 점(x,y) 필요
+                        if seg.ndim == 1:  # 1D 배열인 경우 2D로 변환
+                            # 홀수 개수의 요소가 있는 경우 마지막 요소 제거
+                            if seg.size % 2 != 0:
+                                seg = seg[:-1]
+                            # x,y 쌍으로 재구성
+                            seg = seg.reshape(-1, 2)
+                        valid_segments.append(seg)
+                    else:
+                        # 유효하지 않은 세그멘트는 빈 배열로 대체
+                        valid_segments.append(np.zeros((0, 2), dtype=np.float32))
+                
+                # 빈 배열 처리
+                if not valid_segments:
+                    segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+                else:
+                    # 개별 세그멘트 리샘플링
+                    resampled_segments = []
+                    for seg in valid_segments:
+                        try:
+                            # 점이 너무 적으면 리샘플링 불가능 - 보간할 점 추가
+                            if len(seg) < 2:
+                                resampled_segments.append(np.zeros((segment_resamples, 2), dtype=np.float32))
+                                continue
+                                
+                            if len(seg) < 4:  # 점이 2-3개인 경우 직선으로 보간
+                                # 첫 점과 마지막 점 사이를 균등하게 분할
+                                t = np.linspace(0, 1, segment_resamples)
+                                x = np.interp(t, [0, 1], [seg[0, 0], seg[-1, 0]])
+                                y = np.interp(t, [0, 1], [seg[0, 1], seg[-1, 1]])
+                                resampled = np.column_stack((x, y))
+                            else:
+                                # 정상적인 리샘플링
+                                resampled = resample_segments([seg], n=segment_resamples)[0]
+                            
+                            resampled_segments.append(resampled)
+                        except Exception as e:
+                            # 리샘플링 실패 시 빈 배열로 대체
+                            LOGGER.warning(f"Segment resampling failed: {e}. Using empty array.")
+                            resampled_segments.append(np.zeros((segment_resamples, 2), dtype=np.float32))
+                    
+                    # 모든 세그멘트가 동일한 형태(segment_resamples, 2)인지 확인 
+                    for i, seg in enumerate(resampled_segments):
+                        if seg.shape != (segment_resamples, 2):
+                            # 형태가 다르면 올바른 형태로 재조정
+                            correct_shape = np.zeros((segment_resamples, 2), dtype=np.float32)
+                            # 가능한 범위 내에서 복사
+                            s_len = min(len(seg), segment_resamples)
+                            correct_shape[:s_len] = seg[:s_len]
+                            resampled_segments[i] = correct_shape
+                    
+                    # 스택으로 결합
+                    try:
+                        segments = np.stack(resampled_segments, axis=0)
+                    except ValueError:
+                        # 스택 실패 시 빈 배열로 처리
+                        LOGGER.warning("Failed to stack segments. Using empty array.")
+                        segments = np.zeros((len(resampled_segments), segment_resamples, 2), dtype=np.float32)
+                
+            except Exception as e:
+                # 전체 처리 실패 시 빈 배열 반환
+                LOGGER.warning(f"Segment processing failed: {e}. Using empty array.")
+                segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
-        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        
+        # label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        label["instances"] = Instances(bboxes, segments, keypoints, angles, bbox_format=bbox_format, normalized=normalized)
+        label["task"] = self.task
         return label
 
     @staticmethod

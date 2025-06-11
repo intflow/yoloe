@@ -862,6 +862,15 @@ class Mosaic(BaseMixTransform):
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
+    
+    
+def clip_bboxes(bboxes, img_width, img_height):
+    """클리핑 함수로 바운딩 박스를 이미지 경계 내로 제한."""
+    bboxes[:, 0] = np.clip(bboxes[:, 0], 0, img_width)   # x_min
+    bboxes[:, 1] = np.clip(bboxes[:, 1], 0, img_height)  # y_min
+    bboxes[:, 2] = np.clip(bboxes[:, 2], 0, img_width)   # x_max
+    bboxes[:, 3] = np.clip(bboxes[:, 3], 0, img_height)  # y_max
+    return bboxes
 
 
 class MixUp(BaseMixTransform):
@@ -1227,7 +1236,12 @@ class RandomPerspective:
         # Make sure the coord formats are right
         instances.convert_bbox(format="xyxy")
         instances.denormalize(*img.shape[:2][::-1])
-
+        
+        # 저장된 원본 이미지와 매트릭스
+        import copy  # copy 모듈을 임포트
+        original_img = img.copy()
+        original_instances = copy.deepcopy(instances)
+        original_cls = cls.copy()
         border = labels.pop("mosaic_border", self.border)
         self.size = img.shape[1] + border[1] * 2, img.shape[0] + border[0] * 2  # w, h
         # M is affine matrix
@@ -1238,13 +1252,17 @@ class RandomPerspective:
 
         segments = instances.segments
         keypoints = instances.keypoints
+        
         # Update bboxes if there are segments.
         if len(segments):
-            bboxes, segments = self.apply_segments(segments, M)
+            _, segments = self.apply_segments(segments, M) #Dont recalculate bboxes from segments
 
         if keypoints is not None:
             keypoints = self.apply_keypoints(keypoints, M)
-        new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
+        
+        angles = instances.angles
+        new_instances = Instances(bboxes, segments, keypoints, angles, bbox_format="xyxy", normalized=False)
+        
         # Clip
         new_instances.clip(*self.size)
 
@@ -1252,13 +1270,54 @@ class RandomPerspective:
         instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
         # Make the bboxes have the same scale with new_bboxes
         i = self.box_candidates(
-            box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else 0.10
+            box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else 0.1
         )
-        labels["instances"] = new_instances[i]
-        labels["cls"] = cls[i]
-        labels["img"] = img
-        labels["resized_shape"] = img.shape[:2]
+        
+        # 필터링 결과 확인
+        if not i.any():  # 모든 바운딩 박스가 유효하지 않음
+            clip_bboxes(original_instances.bboxes, original_img.shape[1], original_img.shape[0])
+            labels["instances"] = original_instances
+            labels["cls"] = original_cls  # 원래 클래스 레이블로 복원
+            labels["img"] = original_img
+            labels["resized_shape"] = original_img.shape[:2]
+        else:
+            labels["instances"] = new_instances[i]
+            labels["cls"] = cls[i]
+            labels["img"] = img
+            labels["resized_shape"] = img.shape[:2]
         return labels
+
+        # border = labels.pop("mosaic_border", self.border)
+        # self.size = img.shape[1] + border[1] * 2, img.shape[0] + border[0] * 2  # w, h
+        # # M is affine matrix
+        # # Scale for func:`box_candidates`
+        # img, M, scale = self.affine_transform(img, border)
+
+        # bboxes = self.apply_bboxes(instances.bboxes, M)
+
+        # segments = instances.segments
+        # keypoints = instances.keypoints
+        # # Update bboxes if there are segments.
+        # if len(segments):
+        #     bboxes, segments = self.apply_segments(segments, M)
+
+        # if keypoints is not None:
+        #     keypoints = self.apply_keypoints(keypoints, M)
+        # new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
+        # # Clip
+        # new_instances.clip(*self.size)
+
+        # # Filter instances
+        # instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
+        # # Make the bboxes have the same scale with new_bboxes
+        # i = self.box_candidates(
+        #     box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else 0.10
+        # )
+        # labels["instances"] = new_instances[i]
+        # labels["cls"] = cls[i]
+        # labels["img"] = img
+        # labels["resized_shape"] = img.shape[:2]
+        # return labels
 
     def box_candidates(self, box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):
         """
@@ -1458,16 +1517,37 @@ class RandomFlip:
         h = 1 if instances.normalized else h
         w = 1 if instances.normalized else w
 
+        # # Flip up-down
+        # if self.direction == "vertical" and random.random() < self.p:
+        #     img = np.flipud(img)
+        #     instances.flipud(h)
+        # if self.direction == "horizontal" and random.random() < self.p:
+        #     img = np.fliplr(img)
+        #     instances.fliplr(w)
+        #     # For keypoints
+        #     if self.flip_idx is not None and instances.keypoints is not None:
+        #         instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+        
         # Flip up-down
         if self.direction == "vertical" and random.random() < self.p:
             img = np.flipud(img)
             instances.flipud(h)
+            # For keypoints
+            if self.flip_idx is not None and instances.keypoints is not None:
+                instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+            # For angles
+            if instances.angles is not None:
+                instances.angles = instances.angles * -1.0
         if self.direction == "horizontal" and random.random() < self.p:
             img = np.fliplr(img)
             instances.fliplr(w)
             # For keypoints
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+            # For angles 
+            if instances.angles is not None:
+                instances.angles = instances.angles * -1.0
+        
         labels["img"] = np.ascontiguousarray(img)
         labels["instances"] = instances
         return labels
@@ -2004,63 +2084,63 @@ class Format:
         self.bgr = bgr
 
     def __call__(self, labels):
-        """
-        Formats image annotations for object detection, instance segmentation, and pose estimation tasks.
-
-        This method standardizes the image and instance annotations to be used by the `collate_fn` in PyTorch
-        DataLoader. It processes the input labels dictionary, converting annotations to the specified format and
-        applying normalization if required.
-
-        Args:
-            labels (Dict): A dictionary containing image and annotation data with the following keys:
-                - 'img': The input image as a numpy array.
-                - 'cls': Class labels for instances.
-                - 'instances': An Instances object containing bounding boxes, segments, and keypoints.
-
-        Returns:
-            (Dict): A dictionary with formatted data, including:
-                - 'img': Formatted image tensor.
-                - 'cls': Class labels tensor.
-                - 'bboxes': Bounding boxes tensor in the specified format.
-                - 'masks': Instance masks tensor (if return_mask is True).
-                - 'keypoints': Keypoints tensor (if return_keypoint is True).
-                - 'batch_idx': Batch index tensor (if batch_idx is True).
-
-        Examples:
-            >>> formatter = Format(bbox_format="xywh", normalize=True, return_mask=True)
-            >>> labels = {"img": np.random.rand(640, 640, 3), "cls": np.array([0, 1]), "instances": Instances(...)}
-            >>> formatted_labels = formatter(labels)
-            >>> print(formatted_labels.keys())
-        """
+        """Return formatted image, classes, bounding boxes & keypoints to be used by 'collate_fn'."""
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
-        nl = len(instances)
+
+        # Apply the filtering of small objects and inappropriate aspect ratios
+        # FIXME: need to take min_size and max_ratio from cfg
+        valid_flags = self._filter_instances(
+            instances.bboxes, 
+            instances.keypoints if self.return_keypoint else None, 
+            min_size=10.0, 
+            max_ratio=10.0, 
+            avg_min_distance=6.0
+        )
+
+        nl = int(np.sum(valid_flags))
 
         if self.return_mask:
-            if nl:
+            if nl > 0:
                 masks, instances, cls = self._format_segments(instances, cls, w, h)
-                masks = torch.from_numpy(masks)
+                masks = torch.from_numpy(masks[valid_flags])
             else:
                 masks = torch.zeros(
                     1 if self.mask_overlap else nl, img.shape[0] // self.mask_ratio, img.shape[1] // self.mask_ratio
                 )
             labels["masks"] = masks
+        # yolo v10 code    
+        # if self.normalize:
+        #     instances.normalize(w, h)
         labels["img"] = self._format_img(img)
-        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
-        labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        labels["cls"] = torch.from_numpy(cls[valid_flags]) if nl else torch.zeros(nl)
+        labels["bboxes"] = torch.from_numpy(instances.bboxes[valid_flags]) if nl else torch.zeros((nl, 4))
         if self.return_keypoint:
-            labels["keypoints"] = torch.from_numpy(instances.keypoints)
-            if self.normalize:
-                labels["keypoints"][..., 0] /= w
-                labels["keypoints"][..., 1] /= h
+            if nl > 0:
+                labels["keypoints"] = torch.from_numpy(instances.keypoints[valid_flags])
+                if self.normalize:
+                    labels["keypoints"][..., 0] /= w
+                    labels["keypoints"][..., 1] /= h
+            else:
+                kpt_shape = instances.keypoints.shape
+                labels["keypoints"] = torch.zeros((nl, kpt_shape[1], kpt_shape[2]))
         if self.return_obb:
-            labels["bboxes"] = (
-                xyxyxyxy2xywhr(torch.from_numpy(instances.segments)) if len(instances.segments) else torch.zeros((0, 5))
-            )
+            ##if len(instances.segments):
+            ##    labels["bboxes"] = (
+            ##        xyxyxyxy2xywhr(torch.from_numpy(instances.segments[valid_flags]))
+            ##    )
+            ##else:
+            if nl > 0:
+                bboxes_tensor = torch.from_numpy(instances.bboxes[valid_flags])  # Shape: (N, 4)
+                angles_tensor = torch.from_numpy(instances.angles[valid_flags])
+                labels["bboxes"] = torch.cat((bboxes_tensor, angles_tensor), dim=1)  # Shape: (N, 5)
+            else: 
+                labels["bboxes"] = torch.zeros((nl, 5))
+                
         # NOTE: need to normalize obb in xywhr format for width-height consistency
         if self.normalize:
             labels["bboxes"][:, [0, 2]] /= w
@@ -2069,6 +2149,42 @@ class Format:
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)
         return labels
+    
+    def _filter_instances(self, bboxes, keypoints=None, min_size=4, max_ratio=3.0, avg_min_distance=2.0):
+        
+        """
+        Filters out bounding boxes that are too small, have inappropriate width/height ratios,
+        or have keypoints that are too close together.
+
+        Args:
+            bboxes (np.ndarray): The bounding boxes to filter.
+            keypoints (np.ndarray): The keypoints to filter.
+            min_size (int): Minimum size for width and height.
+            max_ratio (float): Maximum allowed width/height ratio.
+            avg_min_distance (float): Minimum allowable distance between keypoints.
+
+        Returns:
+            np.ndarray: Boolean flags indicating valid bounding boxes.
+        """
+        min_ratio = 1.0 / max_ratio
+        valid_flags = []
+        for i, bbox in enumerate(bboxes):
+            width = bbox[2]
+            height = bbox[3]
+            ratio = width / height if height > 0 else 0
+
+            valid = width >= min_size and height >= min_size and min_ratio <= ratio <= max_ratio
+
+            ##if valid and keypoints is not None:
+            ##    kp = keypoints[i]
+            ##    distances = np.sqrt(np.sum((kp[:, np.newaxis, :] - kp[np.newaxis, :, :])**2, axis=-1))
+            ##    avg_distance = np.mean(distances[distances != np.inf])
+            ##    if avg_distance < avg_min_distance:
+            ##        valid = False
+
+            valid_flags.append(valid)
+
+        return np.array(valid_flags)
 
     def _format_img(self, img):
         """

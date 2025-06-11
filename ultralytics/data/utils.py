@@ -97,7 +97,7 @@ def verify_image(args):
 
 def verify_image_label(args):
     """Verify one image-label pair."""
-    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim = args
+    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, use_obb = args
     # Number (missing, found, empty, corrupt), message, segments, keypoints
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
@@ -119,22 +119,209 @@ def verify_image_label(args):
         if os.path.isfile(lb_file):
             nf = 1  # label found
             with open(lb_file) as f:
-                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
-                    classes = np.array([x[0] for x in lb], dtype=np.float32)
-                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
-                    lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
-                lb = np.array(lb, dtype=np.float32)
+                lb_lines = f.read().strip().splitlines()
+                
+                # 세그멘테이션 정보가 있는지 확인 (33개 이상의 컬럼)
+                has_segments = False
+                
+                # 모든 라벨을 미리 확인
+                all_labels = []
+                for line in lb_lines:
+                    if not line.strip():
+                        continue
+                    
+                    parts = line.strip().split()
+                    if len(parts) > 33:  # 세그멘테이션 정보가 있음
+                        has_segments = True
+                    all_labels.append(parts)
+                
+                if has_segments or any(len(x) > 6 for x in all_labels) and (not keypoint):  # is segment
+                    # 세그멘테이션 데이터가 있는 경우 또는 기존 세그멘테이션 처리
+                    classes = []
+                    segments = []
+                    bbox_data = []  # 바운딩 박스와 키포인트 데이터만 저장
+                    
+                    for parts in all_labels:
+                        try:
+                            # 클래스 정보 추출
+                            cls = float(parts[0])
+                            classes.append(cls)
+                            
+                            if keypoint:
+                                required_cols = 6 + nkpt * ndim if use_obb else 5 + nkpt * ndim
+                                keypoint_end = min(required_cols, len(parts))
+                                bbox_keypoint_data = [float(parts[i]) for i in range(1, keypoint_end)]
+                                
+                                # 세그멘테이션 좌표 추출 (남은 모든 좌표)
+                                seg_coords = []
+                                for i in range(keypoint_end, len(parts), 2):
+                                    if i+1 < len(parts):  # x,y 쌍이 완전한지 확인
+                                        try:
+                                            x, y = float(parts[i]), float(parts[i+1])
+                                            seg_coords.append(x)
+                                            seg_coords.append(y)
+                                        except ValueError:
+                                            # 숫자로 변환할 수 없는 값 처리
+                                            LOGGER.warning(f"Invalid segment coordinate in {lb_file}: {parts[i:i+2]}")
+                                            continue
+                            else:
+                                bbox_cols = 6 if use_obb else 5
+                                bbox_end = min(bbox_cols, len(parts))
+                                bbox_keypoint_data = [float(parts[i]) for i in range(1, bbox_end)]
+                                
+                                # 세그멘테이션 좌표 추출 (남은 모든 좌표)
+                                seg_coords = []
+                                for i in range(bbox_end, len(parts), 2):
+                                    if i+1 < len(parts):  # x,y 쌍이 완전한지 확인
+                                        try:
+                                            x, y = float(parts[i]), float(parts[i+1])
+                                            seg_coords.append(x)
+                                            seg_coords.append(y)
+                                        except ValueError:
+                                            # 숫자로 변환할 수 없는 값 처리
+                                            LOGGER.warning(f"Invalid segment coordinate in {lb_file}: {parts[i:i+2]}")
+                                            continue
+                            
+                            # 세그멘테이션 데이터 저장 (x, y 쌍으로 구성된 2D 배열)
+                            if len(seg_coords) >= 2:  # 최소 1개의 좌표점이 필요
+                                # 세그멘테이션 좌표를 저장
+                                segments.append(np.array(seg_coords, dtype=np.float32).reshape(-1, 2))
+                            
+                            # 바운딩 박스와 키포인트 데이터 준비 (필요한 길이로 맞춤)
+                            if keypoint:
+                                full_req = required_cols - 1
+                            else:
+                                full_req = bbox_cols - 1
+                                
+                            # 데이터 길이 맞추기
+                            if len(bbox_keypoint_data) < full_req:
+                                bbox_keypoint_data.extend([0.0] * (full_req - len(bbox_keypoint_data)))
+                            elif len(bbox_keypoint_data) > full_req:
+                                bbox_keypoint_data = bbox_keypoint_data[:full_req]
+                            
+                            # 바운딩 박스와 키포인트 데이터를 리스트에 추가
+                            bbox_data.append([cls] + bbox_keypoint_data)
+                            
+                        except Exception as e:
+                            # 잘못된 형식의 라벨 처리
+                            LOGGER.warning(f"WARNING: Skipping invalid segment in {lb_file}: {e}")
+                            continue
+                    
+                    # 바운딩 박스 데이터를 NumPy 배열로 변환
+                    try:
+                        lb = np.array(bbox_data, dtype=np.float32)
+                        
+                        # 세그멘테이션 좌표가 없고 일반 세그멘테이션 포맷인 경우
+                        if not has_segments and len(segments) > 0:
+                            # 기존 세그멘테이션 처리 방식 (segments2boxes)
+                            lb = np.concatenate((np.array(classes).reshape(-1, 1), segments2boxes(segments)), 1)
+                            
+                    except Exception as e:
+                        # 길이가 다른 행이 있는 경우 처리
+                        LOGGER.warning(f"Error creating label array in {lb_file}: {e}")
+                        # 빈 배열 생성
+                        if use_obb:
+                            if keypoint:
+                                lb = np.zeros((0, 6 + nkpt * ndim), dtype=np.float32)
+                            else:
+                                lb = np.zeros((0, 6), dtype=np.float32)
+                        else:
+                            if keypoint:
+                                lb = np.zeros((0, 5 + nkpt * ndim), dtype=np.float32)
+                            else:
+                                lb = np.zeros((0, 5), dtype=np.float32)
+                else:
+                    # 일반 바운딩 박스 처리
+                    uniform_lb = []
+                    for parts in all_labels:
+                        try:
+                            # 클래스 추출
+                            cls = float(parts[0])
+                            
+                            # 바운딩 박스 또는 키포인트 데이터 준비
+                            if keypoint:
+                                required_cols = 6 + nkpt * ndim if use_obb else 5 + nkpt * ndim
+                                data_end = min(required_cols, len(parts))
+                                data = [float(parts[i]) for i in range(1, data_end)]
+                                
+                                # 부족한 데이터는 0으로 채움
+                                if len(data) < required_cols - 1:
+                                    data.extend([0.0] * ((required_cols - 1) - len(data)))
+                                elif len(data) > required_cols - 1:
+                                    data = data[:required_cols - 1]
+                            else:
+                                req_cols = 6 if use_obb else 5
+                                data_end = min(req_cols, len(parts))
+                                data = [float(parts[i]) for i in range(1, data_end)]
+                                
+                                # 부족한 데이터는 0으로 채움
+                                if len(data) < req_cols - 1:
+                                    data.extend([0.0] * ((req_cols - 1) - len(data)))
+                                elif len(data) > req_cols - 1:
+                                    data = data[:req_cols - 1]
+                            
+                            uniform_lb.append([cls] + data)
+                        except Exception as e:
+                            # 잘못된 형식의 라벨 처리
+                            LOGGER.warning(f"WARNING: Skipping invalid label in {lb_file}: {e}")
+                            continue
+                    
+                    # 모든 행의 길이를 통일했으므로 안전하게 NumPy 배열로 변환 가능
+                    try:
+                        lb = np.array(uniform_lb, dtype=np.float32)
+                    except Exception as e:
+                        LOGGER.warning(f"Error creating uniform label array in {lb_file}: {e}")
+                        # 빈 배열 생성
+                        if use_obb:
+                            if keypoint:
+                                lb = np.zeros((0, 6 + nkpt * ndim), dtype=np.float32)
+                            else:
+                                lb = np.zeros((0, 6), dtype=np.float32)
+                        else:
+                            if keypoint:
+                                lb = np.zeros((0, 5 + nkpt * ndim), dtype=np.float32)
+                            else:
+                                lb = np.zeros((0, 5), dtype=np.float32)
+                
             nl = len(lb)
             if nl:
-                if keypoint:
-                    assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
-                    points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                # 좌표 유효성 검사
+                if use_obb:
+                    if keypoint:
+                        required_cols = 6 + nkpt * ndim
+                        if lb.shape[1] < required_cols:
+                            LOGGER.warning(f"WARNING: Label {lb_file} has {lb.shape[1]} columns, less than required {required_cols}")
+                            # 부족한 열 채우기
+                            padding = np.zeros((lb.shape[0], required_cols - lb.shape[1]), dtype=np.float32)
+                            lb = np.concatenate((lb, padding), axis=1)
+                        
+                        points = lb[:, 6:].reshape(-1, ndim)[:, :2]
+                    else:
+                        if lb.shape[1] < 6:
+                            LOGGER.warning(f"WARNING: Label {lb_file} has {lb.shape[1]} columns, less than required 6")
+                            # 부족한 열 채우기
+                            padding = np.zeros((lb.shape[0], 6 - lb.shape[1]), dtype=np.float32)
+                            lb = np.concatenate((lb, padding), axis=1)
+                        
+                        points = lb[:, 1:5]
                 else:
-                    assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
-                    points = lb[:, 1:]
-                assert points.max() <= 1, f"non-normalized or out of bounds coordinates {points[points > 1]}"
-                assert lb.min() >= 0, f"negative label values {lb[lb < 0]}"
+                    if keypoint:
+                        required_cols = 5 + nkpt * ndim
+                        if lb.shape[1] < required_cols:
+                            LOGGER.warning(f"WARNING: Label {lb_file} has {lb.shape[1]} columns, less than required {required_cols}")
+                            # 부족한 열 채우기
+                            padding = np.zeros((lb.shape[0], required_cols - lb.shape[1]), dtype=np.float32)
+                            lb = np.concatenate((lb, padding), axis=1)
+                        
+                        points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                    else:
+                        if lb.shape[1] < 5:
+                            LOGGER.warning(f"WARNING: Label {lb_file} has {lb.shape[1]} columns, less than required 5")
+                            # 부족한 열 채우기
+                            padding = np.zeros((lb.shape[0], 5 - lb.shape[1]), dtype=np.float32)
+                            lb = np.concatenate((lb, padding), axis=1)
+                        
+                        points = lb[:, 1:5]
 
                 # All labels
                 max_cls = lb[:, 0].max()  # max label count
@@ -150,16 +337,30 @@ def verify_image_label(args):
                     msg = f"{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed"
             else:
                 ne = 1  # label empty
-                lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+                if use_obb:
+                    lb = np.zeros((0, (6 + nkpt * ndim) if keypoint else 6), dtype=np.float32)
+                else:
+                    lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
         else:
             nm = 1  # label missing
-            lb = np.zeros((0, (5 + nkpt * ndim) if keypoints else 5), dtype=np.float32)
+            
+            if use_obb:
+                lb = np.zeros((0, (6 + nkpt * ndim) if keypoints else 6), dtype=np.float32)
+            else:
+                lb = np.zeros((0, (5 + nkpt * ndim) if keypoints else 5), dtype=np.float32)
         if keypoint:
-            keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
+            if use_obb:
+                keypoints = lb[:, 6:].reshape(-1, nkpt, ndim)
+            else:
+                keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
             if ndim == 2:
                 kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
                 keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
-        lb = lb[:, :5]
+                
+        if use_obb:
+            lb = lb[:, :6]
+        else:
+            lb = lb[:, :5]
         return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1
