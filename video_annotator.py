@@ -33,6 +33,12 @@ import torch
 from tracker.boostTrack.GBI import GBInterpolation
 from tracker.boostTrack.boost_track import BoostTrack
 
+# ─────────────────────── ROI (Region of Interest) Utilities ────────────────────────────── #
+import json
+from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
+import ast
+
 
 # ────────────────────────────── ObjectMeta Class ──────────────────────────── #
 class ObjectMeta:
@@ -58,8 +64,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -92,7 +98,7 @@ def parse_args() -> argparse.Namespace:
                         help="Tracking IoU threshold")
     # Congestion / counting
     parser.add_argument("--max-people", type=int, default=100,
-                        help="People count that corresponds to 100 % congestion")
+                        help="People count that corresponds to 100 percent congestion")
     parser.add_argument("--line-start", nargs=2, type=float,
                         default=None,
                         help="Counting line start (norm. x y, 0~1)")
@@ -120,6 +126,23 @@ def parse_args() -> argparse.Namespace:
                         help="Image brightness adjustment (-50 to 50)")
     parser.add_argument("--denoise", type=float, default=0.1,
                         help="Image denoising strength (0.0-1.0)")
+    # ROI (Region of Interest) Access Detection
+    parser.add_argument("--roi-zones", type=str, 
+                        # default=None,
+                        default="[[214,392,286,392,290,478,214,478],[864,387,945,383,947,465,869,468],[478,14,735,7,736,225,491,221]]",
+                        help="ROI zones as nested list of pixel coordinates")
+    parser.add_argument("--roi-names", type=str, 
+                        # default=None,
+                        default="water_area1,water_area2,feeding_area",
+                        help="ROI zone names separated by comma")
+    parser.add_argument("--roi-detection-method", choices=['bbox', 'mask', 'hybrid'], 
+                        default='bbox', help="ROI detection method: bbox overlap, mask overlap, or hybrid")
+    parser.add_argument("--roi-dwell-time", type=float, default=0.5,
+                        help="Minimum dwell time in seconds for ROI access detection")
+    parser.add_argument("--roi-bbox-threshold", type=float, default=0.1,
+                        help="Minimum bbox overlap ratio for ROI detection")
+    parser.add_argument("--roi-mask-threshold", type=float, default=0.1,
+                        help="Minimum mask overlap ratio for ROI detection")
     return parser.parse_args()
 
 
@@ -135,6 +158,365 @@ def point_side(p, a, b) -> int:
     x2, y2 = b
     val = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
     return 0 if val == 0 else (1 if val > 0 else -1)
+
+
+def parse_roi_zones(roi_zones_str):
+    """ROI zones 문자열을 파싱하여 polygon 리스트로 변환"""
+    if not roi_zones_str:
+        return []
+    
+    try:
+        # 문자열을 리스트로 파싱
+        zones_data = ast.literal_eval(roi_zones_str)
+        
+        polygons = []
+        for zone_coords in zones_data:
+            if len(zone_coords) < 6 or len(zone_coords) % 2 != 0:
+                print(f"⚠️ ROI zone 좌표가 잘못됨: {zone_coords} (최소 3개 점 필요)")
+                continue
+            
+            # [x1,y1,x2,y2,x3,y3,...] → [(x1,y1), (x2,y2), (x3,y3), ...]
+            points = [(zone_coords[i], zone_coords[i+1]) for i in range(0, len(zone_coords), 2)]
+            
+            try:
+                polygon = Polygon(points)
+                if polygon.is_valid:
+                    polygons.append(polygon)
+                else:
+                    print(f"⚠️ 유효하지 않은 polygon: {points}")
+            except Exception as e:
+                print(f"⚠️ Polygon 생성 실패: {points}, 오류: {e}")
+        
+        return polygons
+    
+    except Exception as e:
+        print(f"💥 ROI zones 파싱 오류: {e}")
+        return []
+
+def parse_roi_names(roi_names_str, num_zones):
+    """ROI names 문자열을 파싱하여 이름 리스트로 변환"""
+    if not roi_names_str:
+        # 이름이 없으면 자동으로 Zone_0, Zone_1, ... 생성
+        return [f"Zone_{i}" for i in range(num_zones)]
+    
+    names = [name.strip() for name in roi_names_str.split(',')]
+    
+    # 이름 개수가 부족하면 자동 생성으로 채움
+    while len(names) < num_zones:
+        names.append(f"Zone_{len(names)}")
+    
+    return names[:num_zones]  # 초과하는 이름은 제거
+
+def calculate_bbox_polygon_overlap(bbox, polygon):
+    """bbox와 polygon의 겹침 비율 계산"""
+    try:
+        x1, y1, x2, y2 = bbox
+        bbox_polygon = box(x1, y1, x2, y2)
+        
+        if not bbox_polygon.is_valid or not polygon.is_valid:
+            return 0.0
+        
+        intersection = bbox_polygon.intersection(polygon)
+        if intersection.is_empty:
+            return 0.0
+        
+        bbox_area = bbox_polygon.area
+        if bbox_area == 0:
+            return 0.0
+        
+        overlap_ratio = intersection.area / bbox_area
+        return overlap_ratio
+    
+    except Exception as e:
+        print(f"⚠️ bbox-polygon 겹침 계산 오류: {e}")
+        return 0.0
+
+def calculate_mask_polygon_overlap(mask, polygon, image_shape):
+    """mask와 polygon의 겹침 비율 계산"""
+    try:
+        if mask is None:
+            return 0.0
+        
+        height, width = image_shape[:2]
+        
+        # mask를 이미지 크기에 맞게 조정
+        if mask.shape[:2] != (height, width):
+            mask = cv2.resize(mask.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+        
+        # mask를 boolean으로 변환
+        mask_bool = mask > 0.5
+        
+        # polygon을 mask로 변환
+        polygon_coords = np.array(polygon.exterior.coords, dtype=np.int32)
+        polygon_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(polygon_mask, [polygon_coords], 1)
+        polygon_bool = polygon_mask.astype(bool)
+        
+        # 교집합 계산
+        intersection = np.logical_and(mask_bool, polygon_bool)
+        intersection_area = np.sum(intersection)
+        
+        # mask 전체 면적
+        mask_area = np.sum(mask_bool)
+        if mask_area == 0:
+            return 0.0
+        
+        overlap_ratio = intersection_area / mask_area
+        return overlap_ratio
+    
+    except Exception as e:
+        print(f"⚠️ mask-polygon 겹침 계산 오류: {e}")
+        return 0.0
+
+def check_roi_access(obj, polygon, method, bbox_threshold, mask_threshold, image_shape):
+    """객체가 ROI에 접근했는지 확인"""
+    if method == 'bbox':
+        overlap_ratio = calculate_bbox_polygon_overlap(obj.box, polygon)
+        return overlap_ratio >= bbox_threshold
+    
+    elif method == 'mask':
+        if obj.mask is None:
+            # mask가 없으면 bbox로 fallback
+            overlap_ratio = calculate_bbox_polygon_overlap(obj.box, polygon)
+            return overlap_ratio >= bbox_threshold
+        else:
+            overlap_ratio = calculate_mask_polygon_overlap(obj.mask, polygon, image_shape)
+            return overlap_ratio >= mask_threshold
+    
+    elif method == 'hybrid':
+        # 1단계: bbox 빠른 필터링
+        bbox_overlap = calculate_bbox_polygon_overlap(obj.box, polygon)
+        if bbox_overlap < bbox_threshold:
+            return False
+        
+        # 2단계: mask 정밀 검사 (bbox 겹침이 있을 때만)
+        if obj.mask is not None:
+            mask_overlap = calculate_mask_polygon_overlap(obj.mask, polygon, image_shape)
+            return mask_overlap >= mask_threshold
+        else:
+            # mask가 없으면 bbox 결과 사용
+            return True
+    
+    return False
+
+
+# ─────────────────────── ROI Access Manager Class ────────────────────────────── #
+class ROIAccessManager:
+    """ROI 접근 감지 및 통계 관리 클래스"""
+    
+    def __init__(self, roi_polygons, roi_names, detection_method, dwell_time, 
+                 bbox_threshold, mask_threshold, fps):
+        self.roi_polygons = roi_polygons
+        self.roi_names = roi_names
+        self.detection_method = detection_method
+        self.dwell_time = dwell_time
+        self.bbox_threshold = bbox_threshold
+        self.mask_threshold = mask_threshold
+        self.fps = fps
+        
+        # 접근에 필요한 프레임 수 계산
+        self.required_frames = int(dwell_time * fps)
+        
+        # 각 ROI별 통계
+        self.roi_stats = {}
+        for i, name in enumerate(roi_names):
+            self.roi_stats[name] = {
+                'total_access': 0,
+                'accessed_labels': set(),
+                'track_access_count': {},  # {track_id: access_count}
+                'current_tracks': {}  # {track_id: {'enter_frame': frame, 'label': label, 'consecutive_frames': count}}
+            }
+        
+        print(f"\n🎯 ROI Access Manager 초기화:")
+        print(f"   - ROI 개수: {len(roi_polygons)}")
+        print(f"   - ROI 이름: {roi_names}")
+        print(f"   - 감지 방법: {detection_method}")
+        print(f"   - 체류 시간: {dwell_time}초 ({self.required_frames} 프레임)")
+        print(f"   - bbox 임계값: {bbox_threshold}")
+        print(f"   - mask 임계값: {mask_threshold}")
+    
+    def update(self, tracked_objects, frame_idx, image_shape):
+        """매 프레임마다 ROI 접근 상태 업데이트"""
+        current_frame_tracks = set()
+        
+        for roi_idx, (polygon, roi_name) in enumerate(zip(self.roi_polygons, self.roi_names)):
+            roi_stat = self.roi_stats[roi_name]
+            current_roi_tracks = set()
+            
+            # 현재 프레임에서 이 ROI에 있는 객체들 확인
+            for obj in tracked_objects:
+                if obj.track_id is None or obj.track_id == -1:
+                    continue
+                
+                # ROI 접근 확인
+                is_in_roi = check_roi_access(
+                    obj, polygon, self.detection_method,
+                    self.bbox_threshold, self.mask_threshold, image_shape
+                )
+                
+                if is_in_roi:
+                    current_roi_tracks.add(obj.track_id)
+                    current_frame_tracks.add(obj.track_id)
+                    
+                    if obj.track_id in roi_stat['current_tracks']:
+                        # 이미 ROI에 있던 객체 → 연속 프레임 수 증가
+                        roi_stat['current_tracks'][obj.track_id]['consecutive_frames'] += 1
+                        
+                        # 체류 시간 조건 만족 시 접근으로 카운트
+                        if (roi_stat['current_tracks'][obj.track_id]['consecutive_frames'] >= self.required_frames and
+                            not roi_stat['current_tracks'][obj.track_id].get('counted', False)):
+                            
+                            # 접근 카운트 증가
+                            roi_stat['total_access'] += 1
+                            roi_stat['accessed_labels'].add(obj.class_name)
+                            
+                            if obj.track_id not in roi_stat['track_access_count']:
+                                roi_stat['track_access_count'][obj.track_id] = 0
+                            roi_stat['track_access_count'][obj.track_id] += 1
+                            
+                            # 중복 카운트 방지
+                            roi_stat['current_tracks'][obj.track_id]['counted'] = True
+                            
+                            print(f"🎯 ROI 접근 감지: {roi_name} - track_id:{obj.track_id} ({obj.class_name})")
+                    
+                    else:
+                        # 새로 ROI에 진입한 객체
+                        roi_stat['current_tracks'][obj.track_id] = {
+                            'enter_frame': frame_idx,
+                            'label': obj.class_name,
+                            'consecutive_frames': 1,
+                            'counted': False
+                        }
+            
+            # ROI에서 나간 객체들 제거
+            tracks_to_remove = []
+            for track_id in roi_stat['current_tracks']:
+                if track_id not in current_roi_tracks:
+                    tracks_to_remove.append(track_id)
+            
+            for track_id in tracks_to_remove:
+                del roi_stat['current_tracks'][track_id]
+    
+    def get_current_roi_tracks(self):
+        """현재 각 ROI에 있는 track_id들 반환"""
+        current_tracks = {}
+        for roi_name, roi_stat in self.roi_stats.items():
+            current_tracks[roi_name] = list(roi_stat['current_tracks'].keys())
+        return current_tracks
+    
+    def get_statistics(self):
+        """최종 통계 반환"""
+        stats = {}
+        for roi_name, roi_stat in self.roi_stats.items():
+            stats[roi_name] = {
+                'total_access': roi_stat['total_access'],
+                'accessed_labels': list(roi_stat['accessed_labels']),
+                'track_access_count': dict(roi_stat['track_access_count'])
+            }
+        return stats
+    
+    def save_statistics(self, output_path):
+        """통계를 JSON 파일로 저장"""
+        stats = self.get_statistics()
+        
+        # 추가 메타데이터
+        metadata = {
+            'roi_detection_method': self.detection_method,
+            'dwell_time_seconds': self.dwell_time,
+            'required_frames': self.required_frames,
+            'bbox_threshold': self.bbox_threshold,
+            'mask_threshold': self.mask_threshold,
+            'roi_names': self.roi_names
+        }
+        
+        result = {
+            'metadata': metadata,
+            'roi_statistics': stats
+        }
+        
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"📊 ROI 통계 저장 완료: {output_path}")
+        except Exception as e:
+            print(f"💥 ROI 통계 저장 실패: {e}")
+    
+    def print_final_statistics(self):
+        """최종 통계를 콘솔에 출력"""
+        print(f"\n🎯 ROI 접근 감지 최종 통계:")
+        print(f"{'='*50}")
+        
+        for roi_name, roi_stat in self.roi_stats.items():
+            print(f"\n📍 {roi_name}: {roi_stat['total_access']}회 접근")
+            
+            if roi_stat['accessed_labels']:
+                print(f"   접근한 클래스: {', '.join(sorted(roi_stat['accessed_labels']))}")
+            
+            if roi_stat['track_access_count']:
+                print(f"   Track ID별 접근 횟수:")
+                for track_id, count in sorted(roi_stat['track_access_count'].items()):
+                    print(f"     - Track {track_id}: {count}회")
+            
+            if not roi_stat['total_access']:
+                print(f"   접근 기록 없음")
+        
+        print(f"{'='*50}")
+
+
+# ─────────────────────── ROI Visualization Functions ────────────────────────────── #
+def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
+    """ROI polygon들을 이미지에 그리기"""
+    for polygon, roi_name in zip(roi_polygons, roi_names):
+        try:
+            # polygon 좌표 추출
+            coords = np.array(polygon.exterior.coords, dtype=np.int32)
+            
+            # 빨간색 테두리로 polygon 그리기
+            cv2.polylines(image, [coords], isClosed=True, color=(255, 0, 0), thickness=6)
+            
+            # ROI 이름과 접근 횟수 표시
+            if roi_name in roi_stats:
+                total_access = roi_stats[roi_name]['total_access']
+                
+                # polygon의 중심점 계산
+                centroid = polygon.centroid
+                text_x, text_y = int(centroid.x), int(centroid.y)
+                
+                # 텍스트 배경
+                text = f"{roi_name}: {total_access}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                thickness = 2
+                (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                
+                # 배경 사각형
+                cv2.rectangle(image, (text_x - 5, text_y - text_h - 10), 
+                             (text_x + text_w + 5, text_y + 5), (255, 0, 0), -1)
+                
+                # 텍스트
+                cv2.putText(image, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+        
+        except Exception as e:
+            print(f"⚠️ ROI polygon 그리기 오류: {e}")
+    
+    return image
+
+def highlight_roi_objects(image, tracked_objects, current_roi_tracks, color_palette):
+    """현재 ROI에 있는 객체들을 하이라이트"""
+    # 모든 ROI에 있는 track_id들 수집
+    all_roi_track_ids = set()
+    for roi_tracks in current_roi_tracks.values():
+        all_roi_track_ids.update(roi_tracks)
+    
+    # ROI에 있는 객체들에 빨간색 하이라이트 추가
+    for obj in tracked_objects:
+        if obj.track_id in all_roi_track_ids:
+            x1, y1, x2, y2 = map(int, obj.box)
+            
+            # 빨간색 굵은 테두리 추가
+            cv2.rectangle(image, (x1-2, y1-2), (x2+2, y2+2), (255, 0, 0), 4)
+    
+    return image
 
 
 # ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
@@ -1062,7 +1444,9 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                          p1, p2, seg_dx, seg_dy, seg_len2,
                          width, height,
                          # Progress bar & Queue monitoring
-                         pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None):
+                         pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None,
+                         # ROI Access Detection
+                         roi_manager=None):
     """Batch 결과를 개별 프레임으로 처리 (CPU 데이터 기반)"""
     
     updated_state = {
@@ -1088,6 +1472,12 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         
         # Tracker 업데이트 (기존 로직 유지)
         tracked_objects = tracker.update(detected_objects, cpu_result['orig_img'], "None")
+        
+        # ROI Access Detection 업데이트
+        current_roi_tracks = {}
+        if roi_manager is not None:
+            roi_manager.update(tracked_objects, frame_idx, cpu_result['orig_img'].shape)
+            current_roi_tracks = roi_manager.get_current_roi_tracks()
         
         # 기존 변수들 추출 (호환성 유지)
         if tracked_objects:
@@ -1127,6 +1517,16 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         annotated = frame_rgb.copy()
         if tracked_objects:
             annotated = draw_objects_overlay(annotated, tracked_objects, palette)
+        
+        # ROI 시각화
+        if roi_manager is not None:
+            # ROI polygon 그리기
+            annotated = draw_roi_polygons(annotated, roi_manager.roi_polygons, 
+                                        roi_manager.roi_names, roi_manager.roi_stats)
+            
+            # ROI에 있는 객체들 하이라이트
+            annotated = highlight_roi_objects(annotated, tracked_objects, 
+                                            current_roi_tracks, palette)
 
         # Occupancy 업데이트
         raw_occupancy = int(np.sum(class_ids == person_class_id))
@@ -1193,13 +1593,18 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
             cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), 8, tipLength=0.6)
 
-        # Overlay 정보 그리기
+        # Overlay 정보 그리기 (ROI 정보 추가)
         overlay = [
             f"[1] Congestion : {updated_state['current_congestion']:3d} %",
             f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
             f"[3] Occupancy  : {updated_state['current_occupancy']}",
             f"[4] Time      : {time_str}"
         ]
+        
+        # ROI 접근 횟수 정보 추가
+        if roi_manager is not None:
+            for roi_name, roi_stat in roi_manager.roi_stats.items():
+                overlay.append(f"[ROI] {roi_name}: {roi_stat['total_access']} accesses")
         x0, y0, dy = 30, 60, 50
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 1
@@ -1417,6 +1822,30 @@ def main() -> None:
     # Heat-map 누적 버퍼
     heatmap = np.zeros((height, width), dtype=np.float32)
 
+    # ─────────────── ROI Access Detection 설정 ──────────────── #
+    roi_manager = None
+    if args.roi_zones:
+        # ROI zones 파싱
+        roi_polygons = parse_roi_zones(args.roi_zones)
+        if roi_polygons:
+            # ROI names 파싱
+            roi_names = parse_roi_names(args.roi_names, len(roi_polygons))
+            
+            # ROI Access Manager 초기화
+            roi_manager = ROIAccessManager(
+                roi_polygons=roi_polygons,
+                roi_names=roi_names,
+                detection_method=args.roi_detection_method,
+                dwell_time=args.roi_dwell_time,
+                bbox_threshold=args.roi_bbox_threshold,
+                mask_threshold=args.roi_mask_threshold,
+                fps=fps
+            )
+        else:
+            print("⚠️ ROI zones 파싱 실패, ROI 기능 비활성화")
+    else:
+        print("📍 ROI zones 미설정, ROI 기능 비활성화")
+
     # 라인 깜박임 상태
     line_flash = False
 
@@ -1490,7 +1919,9 @@ def main() -> None:
                     p1, p2, seg_dx, seg_dy, seg_len2,
                     width, height,
                     # Progress bar & Queue monitoring
-                    pbar, frame_queue, result_queue, pipeline_stats
+                    pbar, frame_queue, result_queue, pipeline_stats,
+                    # ROI Access Detection
+                    roi_manager
                 )
                 
                 # 상태 변수 업데이트
@@ -1598,6 +2029,14 @@ def main() -> None:
     print(f"   - 최종 occupancy: {current_occupancy}")
     print(f"   - 최종 congestion: {current_congestion}%")
     print(f"   - 라인 크로싱: forward {forward_cnt}, backward {backward_cnt}")
+    
+    # ROI 최종 통계 출력 및 저장
+    if roi_manager is not None:
+        roi_manager.print_final_statistics()
+        
+        # ROI 통계 JSON 파일로 저장
+        roi_stats_path = os.path.join(output_dir, "roi_statistics.json")
+        roi_manager.save_statistics(roi_stats_path)
     
     # if args.cross_vp and prev_vpe is not None:
     #     print(f"🧠 VPE 정보:")
