@@ -52,6 +52,7 @@ class ObjectMeta:
 
 
 # ────────────────────────────── CLI ──────────────────────────────────── #
+# ANCHOR argparse
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
@@ -101,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=150,
                         help="Interval for saving intermediate frames")
     # Batch processing
-    parser.add_argument("--batch-size", type=int, default=64,
+    parser.add_argument("--batch-size", type=int, default=24,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
@@ -328,6 +329,279 @@ def draw_objects_overlay(image, objects, color_palette):
     return image
 
 
+# ─────────────────────── Inference Thread Class ────────────────────────────── #
+class InferenceThread(threading.Thread):
+    """
+    🧠 GPU 추론 및 VPE 업데이트를 전담하는 스레드
+    Frame Loading Thread → Inference Thread → Main Thread 파이프라인의 중간 단계
+    """
+    
+    def __init__(self, frame_queue, result_queue, model, model_vp, args):
+        super().__init__(daemon=True)
+        self.frame_queue = frame_queue
+        self.result_queue = result_queue
+        self.model = model
+        self.model_vp = model_vp
+        self.args = args
+        self.stop_event = threading.Event()
+        self.prev_vpe = None  # VPE 상태 관리
+        self.stats = {
+            'total_batches_processed': 0,
+            'total_frames_processed': 0,
+            'vpe_updates': 0,
+            'failed_batches': 0
+        }
+        
+        print(f"\n🧠 Inference Thread 초기화:")
+        print(f"   - GPU 디바이스: {args.device}")
+        print(f"   - Cross-VP 모드: {'활성화' if args.cross_vp else '비활성화'}")
+        print(f"   - VPE 모멘텀: {args.vpe_momentum}")
+    
+    def stop(self):
+        """스레드 종료 요청"""
+        self.stop_event.set()
+        print("🛑 Inference Thread 종료 요청됨")
+    
+    # ANCHOR Batch Inference    
+    def run(self):
+        """메인 GPU 추론 루프"""
+        print("\n🚀 Inference Thread 시작!")
+        
+        try:
+            batch_idx = 0
+            while not self.stop_event.is_set():
+                try:
+                    # Frame Queue에서 배치 데이터 가져오기 (타임아웃 3초)
+                    batch_data = self.frame_queue.get(timeout=3.0)
+                    
+                    # 종료 신호 확인
+                    if batch_data is None:
+                        print("🏁 Inference Thread: Frame Loading 종료 신호 수신")
+                        # Main Thread에도 종료 신호 전달
+                        self.result_queue.put(None)
+                        break
+                    
+                    # 배치 데이터 언패킹
+                    batch_frames = batch_data['batch_frames']
+                    batch_indices = batch_data['batch_indices']
+                    batch_original_frames = batch_data['batch_original_frames']
+                    loaded_count = batch_data['loaded_count']
+                    
+                    if not batch_frames:
+                        print("⚠️ Inference Thread: 빈 batch 수신, 건너뛰기")
+                        continue
+                    
+                    # print(f"🧠 Batch {batch_idx + 1} GPU 추론 시작: {loaded_count} 프레임")
+                    
+                    # ──────── GPU INFERENCE ──────── #
+                    batch_results = self._inference_batch(batch_frames)
+                    
+                    if batch_results is None:
+                        print(f"❌ Batch {batch_idx + 1} 추론 실패")
+                        self.stats['failed_batches'] += 1
+                        continue
+                    
+                    # ──────── VPE UPDATE ──────── #
+                    vpe_updated = False
+                    if self.args.cross_vp:
+                        vpe_updated = self._update_vpe(batch_results)
+                    
+                    # 결과 패키징
+                    result_data = {
+                        'batch_results': batch_results,
+                        'batch_indices': batch_indices,
+                        'batch_original_frames': batch_original_frames,
+                        'loaded_count': loaded_count,
+                        'batch_idx': batch_idx,
+                        'vpe_updated': vpe_updated,
+                        'prev_vpe_status': self.prev_vpe is not None
+                    }
+                    
+                    # Result Queue에 전달
+                    self.result_queue.put(result_data)
+                    
+                    # 통계 업데이트
+                    self.stats['total_batches_processed'] += 1
+                    self.stats['total_frames_processed'] += loaded_count
+                    if vpe_updated:
+                        self.stats['vpe_updates'] += 1
+                    
+                    # print(f"✅ Batch {batch_idx + 1} GPU 처리 완료: {loaded_count} 프레임 → Result Queue")
+                    batch_idx += 1
+                    
+                except queue.Empty:
+                    # Frame Queue가 비어있으면 잠시 대기
+                    continue
+                    
+                except Exception as e:
+                    print(f"💥 Inference Thread 오류: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.stats['failed_batches'] += 1
+                    
+        except Exception as e:
+            print(f"💥 Inference Thread 치명적 오류: {e}")
+        finally:
+            # 종료 신호를 Result Queue에 전달 (아직 전달하지 않았다면)
+            try:
+                self.result_queue.put(None, timeout=1.0)
+                print("🏁 Inference Thread 종료 신호 Result Queue에 전달")
+            except queue.Full:
+                print("⚠️ Result Queue 가득 차서 종료 신호 전달 실패")
+            
+            print(f"📈 Inference Thread 최종 통계:")
+            print(f"   - 처리된 배치 수: {self.stats['total_batches_processed']}")
+            print(f"   - 처리된 프레임 수: {self.stats['total_frames_processed']}")
+            print(f"   - VPE 업데이트 횟수: {self.stats['vpe_updates']}")
+            print(f"   - 실패한 배치 수: {self.stats['failed_batches']}")
+    
+    def _inference_batch(self, batch_frames):
+        """배치 추론 실행"""
+        try:
+            batch_size = len(batch_frames)
+            
+            if self.prev_vpe is not None and self.args.cross_vp:
+                # VPE 모드로 추론
+                self.model_vp.set_classes(self.args.names, self.prev_vpe)
+                self.model_vp.predictor = None
+                
+                results = self.model_vp.predict(
+                    source=batch_frames,
+                    imgsz=self.args.image_size,
+                    conf=self.args.conf_thresh,
+                    iou=self.args.iou_thresh,
+                    verbose=False
+                )
+            else:
+                # 기본 모드로 추론
+                results = self.model.predict(
+                    source=batch_frames,
+                    imgsz=self.args.image_size,
+                    conf=0.05,
+                    iou=self.args.iou_thresh,
+                    verbose=False
+                )
+            
+            return results
+            
+        except Exception as e:
+            print(f"💥 배치 추론 오류: {e}")
+            return None
+    
+    def _update_vpe(self, batch_results):
+        """VPE 업데이트 (기존 로직 활용)"""
+        try:
+            current_vpe = self._update_batch_vpe(batch_results)
+            
+            if current_vpe is not None:
+                if self.prev_vpe is None:
+                    # 첫 번째 VPE
+                    self.prev_vpe = current_vpe
+                    # print(f"🎯 첫 번째 VPE 설정 완료")
+                else:
+                    # VPE Moving Average
+                    momentum = self.args.vpe_momentum
+                    self.prev_vpe = momentum * self.prev_vpe + (1 - momentum) * current_vpe
+                    # print(f"🔄 VPE Moving Average 업데이트 완료")
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            print(f"💥 VPE 업데이트 오류: {e}")
+            return False
+    
+    def _update_batch_vpe(self, batch_results):
+        """배치 결과에서 VPE 생성 (기존 함수 로직 활용)"""
+        high_conf_prompts = []
+        
+        # Batch 내 모든 프레임에서 high-confidence detection 수집
+        for i, result in enumerate(batch_results):
+            if len(result.boxes) > 0:
+                confidences = result.boxes.conf.cpu().numpy()
+                boxes = result.boxes.xyxy.cpu().numpy()
+                class_ids = result.boxes.cls.cpu().numpy()
+                
+                high_conf_mask = confidences >= self.args.vp_thresh
+                
+                if np.any(high_conf_mask):
+                    # High confidence detection을 프롬프트로 사용
+                    prompt_data = {
+                        "bboxes": boxes[high_conf_mask],
+                        "cls": class_ids[high_conf_mask],
+                        "frame": result.orig_img,
+                        "frame_idx": i
+                    }
+                    
+                    # 모든 클래스가 포함되도록 추가
+                    for cls_idx in range(len(self.args.names)):
+                        if cls_idx not in class_ids:
+                            prompt_data["bboxes"] = np.append(prompt_data["bboxes"], [[0, 0, 0, 0]], axis=0)
+                            prompt_data["cls"] = np.append(prompt_data["cls"], [cls_idx])                
+                            
+                    high_conf_prompts.append(prompt_data)
+                    
+        if high_conf_prompts:
+            # Batch 내 프롬프트들로 VPE 생성
+            batch_vpe = self._generate_batch_vpe(high_conf_prompts)
+            return batch_vpe
+        else:
+            return None
+    
+    def _generate_batch_vpe(self, prompts_list):
+        """여러 프롬프트에서 VPE를 배치로 생성 후 평균화 (기존 함수 로직 활용)"""
+        
+        # 배치용 이미지와 프롬프트 준비
+        batch_images = []
+        batch_prompts = {"bboxes": [], "cls": []}
+        
+        for i, prompt_data in enumerate(prompts_list):
+            # 이미지 준비
+            frame_rgb = cv2.cvtColor(prompt_data["frame"], cv2.COLOR_BGR2RGB)
+            batch_images.append(Image.fromarray(frame_rgb))
+            
+            # 프롬프트 준비
+            batch_prompts["bboxes"].append(prompt_data["bboxes"])
+            batch_prompts["cls"].append(prompt_data["cls"])
+        
+        try:
+            # 배치 VPE 생성
+            self.model_vp.predictor = None  # VPE 생성 전 초기화
+            self.model_vp.predict(
+                source=batch_images,
+                prompts=batch_prompts,
+                predictor=YOLOEVPSegPredictor,
+                return_vpe=True,
+                imgsz=self.args.image_size,
+                conf=self.args.vp_thresh,
+                iou=self.args.iou_thresh,
+                verbose=False
+            )
+            
+            # VPE 추출
+            if hasattr(self.model_vp, 'predictor') and hasattr(self.model_vp.predictor, 'vpe'):
+                batch_vpe = self.model_vp.predictor.vpe
+                
+                # 배치 차원을 평균화하여 단일 VPE로 변환
+                if len(batch_vpe.shape) > 2:  # (batch_size, classes, features) 형태인 경우
+                    averaged_vpe = batch_vpe.mean(dim=0, keepdim=True)  # (1, classes, features)
+                else:
+                    averaged_vpe = batch_vpe
+                
+                # 예측기 정리
+                self.model_vp.predictor = None
+                
+                return averaged_vpe
+            else:
+                self.model_vp.predictor = None
+                return None
+                
+        except Exception as e:
+            print(f"💥 배치 VPE 생성 중 오류: {e}")
+            self.model_vp.predictor = None
+            return None
+
+
 # ─────────────────────── Frame Loading Thread Class ────────────────────────────── #
 class FrameLoadingThread(threading.Thread):
     """
@@ -352,7 +626,7 @@ class FrameLoadingThread(threading.Thread):
         
         self.queue_full_print = False
         
-        print(f"🎬 Frame Loading Thread 초기화:")
+        print(f"\n🎬 Frame Loading Thread 초기화:")
         print(f"   - 총 프레임: {total_frames}")
         print(f"   - 배치 크기: {batch_size}")
         print(f"   - Queue 최대 크기: {max_queue_size}")
@@ -363,9 +637,10 @@ class FrameLoadingThread(threading.Thread):
         self.stop_event.set()
         print("🛑 Frame Loading Thread 종료 요청됨")
     
+    # ANCHOR Load Batch Frames
     def run(self):
         """메인 프레임 로딩 루프"""
-        print("🚀 Frame Loading Thread 시작!")
+        print("\n🚀 Frame Loading Thread 시작!")
         
         try:
             while not self.stop_event.is_set() and self.current_frame < self.total_frames:
@@ -489,123 +764,121 @@ class FrameLoadingThread(threading.Thread):
             'total_count': batch_size
         }
 
-
-# ─────────────────────── Batch Processing Functions ────────────────────────────── #
-def load_batch_frames(cap, start_frame, end_frame, args):
-    """지정된 범위의 프레임들을 멀티스레딩으로 배치 로드"""
-    import concurrent.futures
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
+# def load_batch_frames(cap, start_frame, end_frame, args):
+#     """지정된 범위의 프레임들을 멀티스레딩으로 배치 로드"""
+#     import concurrent.futures
+#     import threading
+#     from concurrent.futures import ThreadPoolExecutor
     
-    batch_size = end_frame - start_frame
-    print(f"   📂 프레임 {start_frame}-{end_frame-1} 로딩 중... (배치 크기: {batch_size}, 스레드: {min(args.frame_loading_threads, batch_size)}개)")
+#     batch_size = end_frame - start_frame
+#     print(f"   📂 프레임 {start_frame}-{end_frame-1} 로딩 중... (배치 크기: {batch_size}, 스레드: {min(args.frame_loading_threads, batch_size)}개)")
     
-    # 스레드 세이프한 프레임 데이터 저장
-    frame_data = {}
-    lock = threading.Lock()
+#     # 스레드 세이프한 프레임 데이터 저장
+#     frame_data = {}
+#     lock = threading.Lock()
     
-    def load_single_frame(frame_idx):
-        """단일 프레임 로딩 (스레드에서 실행)"""
-        try:
-            # 각 스레드마다 별도의 VideoCapture 사용 (스레드 세이프)
-            thread_cap = cv2.VideoCapture(args.source)
-            thread_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, frame_bgr = thread_cap.read()
-            thread_cap.release()
+#     def load_single_frame(frame_idx):
+#         """단일 프레임 로딩 (스레드에서 실행)"""
+#         try:
+#             # 각 스레드마다 별도의 VideoCapture 사용 (스레드 세이프)
+#             thread_cap = cv2.VideoCapture(args.source)
+#             thread_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+#             ok, frame_bgr = thread_cap.read()
+#             thread_cap.release()
             
-            if ok:
-                # RGB 변환 및 전처리
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_rgb = preprocess_image(frame_rgb, args)
+#             if ok:
+#                 # RGB 변환 및 전처리
+#                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+#                 frame_rgb = preprocess_image(frame_rgb, args)
                 
-                # PIL Image로 변환
-                pil_frame = Image.fromarray(frame_rgb)
+#                 # PIL Image로 변환
+#                 pil_frame = Image.fromarray(frame_rgb)
                 
-                # 스레드 세이프하게 저장
-                with lock:
-                    frame_data[frame_idx] = {
-                        'pil_frame': pil_frame,
-                        'original_frame': frame_bgr.copy(),
-                        'success': True
-                    }
+#                 # 스레드 세이프하게 저장
+#                 with lock:
+#                     frame_data[frame_idx] = {
+#                         'pil_frame': pil_frame,
+#                         'original_frame': frame_bgr.copy(),
+#                         'success': True
+#                     }
                     
-                    # 진행 상황 출력 (10% 단위)
-                    loaded_count = len(frame_data)
-                    if loaded_count % max(1, batch_size // 10) == 0:
-                        progress = (loaded_count / batch_size) * 100
-                        print(f"     📊 프레임 로딩 진행률: {progress:.0f}% ({loaded_count}/{batch_size})")
-            else:
-                with lock:
-                    frame_data[frame_idx] = {'success': False}
+#                     # 진행 상황 출력 (10% 단위)
+#                     loaded_count = len(frame_data)
+#                     if loaded_count % max(1, batch_size // 10) == 0:
+#                         progress = (loaded_count / batch_size) * 100
+#                         print(f"     📊 프레임 로딩 진행률: {progress:.0f}% ({loaded_count}/{batch_size})")
+#             else:
+#                 with lock:
+#                     frame_data[frame_idx] = {'success': False}
                     
-        except Exception as e:
-            with lock:
-                frame_data[frame_idx] = {'success': False, 'error': str(e)}
+#         except Exception as e:
+#             with lock:
+#                 frame_data[frame_idx] = {'success': False, 'error': str(e)}
     
-    # 멀티스레딩으로 프레임 로딩 (사용자 설정 스레드 수 사용)
-    max_workers = min(args.frame_loading_threads, batch_size)  # 배치 크기보다 많은 스레드는 불필요
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 모든 프레임 인덱스에 대해 병렬 처리
-        frame_indices = list(range(start_frame, end_frame))
-        futures = [executor.submit(load_single_frame, idx) for idx in frame_indices]
+#     # 멀티스레딩으로 프레임 로딩 (사용자 설정 스레드 수 사용)
+#     max_workers = min(args.frame_loading_threads, batch_size)  # 배치 크기보다 많은 스레드는 불필요
+#     with ThreadPoolExecutor(max_workers=max_workers) as executor:
+#         # 모든 프레임 인덱스에 대해 병렬 처리
+#         frame_indices = list(range(start_frame, end_frame))
+#         futures = [executor.submit(load_single_frame, idx) for idx in frame_indices]
         
-        # 모든 스레드 완료 대기
-        concurrent.futures.wait(futures)
+#         # 모든 스레드 완료 대기
+#         concurrent.futures.wait(futures)
     
-    # 결과 정리 (인덱스 순서대로)
-    batch_frames = []
-    batch_indices = []
-    batch_original_frames = []
+#     # 결과 정리 (인덱스 순서대로)
+#     batch_frames = []
+#     batch_indices = []
+#     batch_original_frames = []
     
-    loaded_count = 0
-    for frame_idx in range(start_frame, end_frame):
-        if frame_idx in frame_data and frame_data[frame_idx]['success']:
-            batch_frames.append(frame_data[frame_idx]['pil_frame'])
-            batch_indices.append(frame_idx)
-            batch_original_frames.append(frame_data[frame_idx]['original_frame'])
-            loaded_count += 1
+#     loaded_count = 0
+#     for frame_idx in range(start_frame, end_frame):
+#         if frame_idx in frame_data and frame_data[frame_idx]['success']:
+#             batch_frames.append(frame_data[frame_idx]['pil_frame'])
+#             batch_indices.append(frame_idx)
+#             batch_original_frames.append(frame_data[frame_idx]['original_frame'])
+#             loaded_count += 1
     
-    print(f"   ✅ 프레임 로딩 완료: {loaded_count}/{batch_size} 성공 ({(loaded_count/batch_size)*100:.1f}%)")
+#     print(f"   ✅ 프레임 로딩 완료: {loaded_count}/{batch_size} 성공 ({(loaded_count/batch_size)*100:.1f}%)")
     
-    return batch_frames, batch_indices, batch_original_frames
+#     return batch_frames, batch_indices, batch_original_frames
 
-
-def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
-    """Batch 단위로 inference 수행"""
+# def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
+#     """Batch 단위로 inference 수행"""
     
-    batch_size = len(batch_frames)
-    # print(f"   🧠 배치 추론 시작: {batch_size}개 프레임 처리")
+#     batch_size = len(batch_frames)
+#     # print(f"   🧠 배치 추론 시작: {batch_size}개 프레임 처리")
     
-    if prev_vpe is not None and args.cross_vp:
-        # print(f"   🎯 VPE 모드로 추론 중...")
-        # 이전 batch의 VPE를 현재 batch에 적용
-        model_vp.set_classes(args.names, prev_vpe)
-        model_vp.predictor = None
+#     if prev_vpe is not None and args.cross_vp:
+#         # print(f"   🎯 VPE 모드로 추론 중...")
+#         # 이전 batch의 VPE를 현재 batch에 적용
+#         model_vp.set_classes(args.names, prev_vpe)
+#         model_vp.predictor = None
         
-        # Batch inference with VPE
-        results = model_vp.predict(
-            source=batch_frames,  # 리스트로 전달하면 batch 처리됨
-            imgsz=args.image_size,
-            conf=args.conf_thresh,
-            iou=args.iou_thresh,
-            verbose=False
-        )
-        # print(f"   ✅ VPE 추론 완료: {len(results)}개 결과 생성")
-    else:
-        # print(f"   🔍 기본 모드로 추론 중...")
-        # 첫 번째 batch 또는 VPE 없이 처리
-        results = model.predict(
-            source=batch_frames,
-            imgsz=args.image_size,
-            conf=0.05,
-            iou=args.iou_thresh,
-            verbose=False
-        )
-        # print(f"   ✅ 기본 추론 완료: {len(results)}개 결과 생성")
+#         # Batch inference with VPE
+#         results = model_vp.predict(
+#             source=batch_frames,  # 리스트로 전달하면 batch 처리됨
+#             imgsz=args.image_size,
+#             conf=args.conf_thresh,
+#             iou=args.iou_thresh,
+#             verbose=False
+#         )
+#         # print(f"   ✅ VPE 추론 완료: {len(results)}개 결과 생성")
+#     else:
+#         # print(f"   🔍 기본 모드로 추론 중...")
+#         # 첫 번째 batch 또는 VPE 없이 처리
+#         results = model.predict(
+#             source=batch_frames,
+#             imgsz=args.image_size,
+#             conf=0.05,
+#             iou=args.iou_thresh,
+#             verbose=False
+#         )
+#         # print(f"   ✅ 기본 추론 완료: {len(results)}개 결과 생성")
     
-    return results
+#     return results
 
 
+# ANCHOR Update Batch VPE
 def update_batch_vpe(batch_results, model_vp, args):
     """Batch 결과에서 VPE 생성 및 평균화"""
     
@@ -649,7 +922,7 @@ def update_batch_vpe(batch_results, model_vp, args):
         print("⚠️ High-confidence detection이 없어 VPE 생성 불가")
         return None
 
-
+# ANCHOR VPE Generation
 def generate_batch_vpe(prompts_list, model_vp, args):
     """여러 프롬프트에서 VPE를 배치로 생성 후 평균화"""
     
@@ -710,7 +983,7 @@ def generate_batch_vpe(prompts_list, model_vp, args):
         model_vp.predictor = None
         return None
 
-
+# ANCHOR Detection Result Processing
 def process_batch_results(batch_results, batch_indices, batch_original_frames, 
                          tracker, args, fps, palette, person_class_id,
                          # 상태 변수들
@@ -721,7 +994,9 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                          output_dir, out, log_file,
                          # 라인 크로싱 관련
                          p1, p2, seg_dx, seg_dy, seg_len2,
-                         width, height):
+                         width, height,
+                         # Progress bar
+                         pbar=None):
     """Batch 결과를 개별 프레임으로 처리"""
     
     updated_state = {
@@ -907,6 +1182,20 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
 
         # 비디오 출력
         out.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+        
+        # Progress bar 즉시 업데이트 (프레임 단위)
+        if pbar is not None:
+            pbar.update(1)
+            
+            # # 주기적으로 postfix 업데이트 (매 10 프레임마다)
+            # if frame_idx % 10 == 0:
+            #     pbar.set_postfix({
+            #         'occupancy': updated_state['current_occupancy'],
+            #         'congestion': f"{updated_state['current_congestion']}%",
+            #         'forward': updated_state['forward_cnt'],
+            #         'backward': updated_state['backward_cnt'],
+            #         'frame': frame_idx
+            #     })
     
     return updated_state
 
@@ -997,11 +1286,17 @@ def main() -> None:
     total_batches = (total_frames + batch_size - 1) // batch_size
     max_queue_size = 3  # Queue 최대 크기 (메모리 제어)
     
-    print(f"🚀 Pipeline 처리 시작: {total_frames} 프레임을 {batch_size} 단위로 {total_batches} batch 처리")
-    print(f"📦 Queue 기반 병렬 처리: Frame Loading Thread + Inference Pipeline")
+    print(f"\n🚀 Pipeline 처리 시작: {total_frames} 프레임을 {batch_size} 단위로 {total_batches} batch 처리")
+    # print(f"📦 Queue 기반 병렬 처리: Frame Loading Thread + Inference Pipeline")
 
-    # ─────────────── Queue 및 Thread 설정 ─────────── #
-    batch_queue = queue.Queue(maxsize=max_queue_size)
+    # ─────────────── 🚀 3단계 Pipeline Queue 및 Thread 설정 ─────────── #
+    frame_queue = queue.Queue(maxsize=max_queue_size)    # Frame Loading → Inference
+    result_queue = queue.Queue(maxsize=max_queue_size)   # Inference → Main
+    
+    print(f"\n🔗 3단계 Pipeline 구성:")
+    print(f"   Stage 1: Frame Loading Thread → Frame Queue")
+    print(f"   Stage 2: Inference Thread → Result Queue") 
+    print(f"   Stage 3: Main Thread (Process Results)")
     
     # Frame Loading Thread 시작
     frame_loader = FrameLoadingThread(
@@ -1009,11 +1304,11 @@ def main() -> None:
         total_frames=total_frames,
         batch_size=batch_size,
         args=args,
-        batch_queue=batch_queue,
+        batch_queue=frame_queue,  # frame_queue로 변경
         max_queue_size=max_queue_size
     )
     frame_loader.start()
-    print(f"🎬 Frame Loading Thread 시작됨 (PID: {frame_loader.ident})")
+    # print(f"🎬 Stage 1 시작: Frame Loading Thread (PID: {frame_loader.ident})")
 
     # ─────────────── Model & palette ─────────── #
     model = YOLOE(args.checkpoint)
@@ -1026,6 +1321,17 @@ def main() -> None:
     model_vp.eval()
     model_vp.to(args.device)
     model_vp.set_classes(args.names, model_vp.get_text_pe(args.names))
+
+    # Inference Thread 시작
+    inference_thread = InferenceThread(
+        frame_queue=frame_queue,
+        result_queue=result_queue,
+        model=model,
+        model_vp=model_vp,
+        args=args
+    )
+    inference_thread.start()
+    # print(f"🧠 Stage 2 시작: Inference Thread (PID: {inference_thread.ident})")
 
     person_class_id = args.names.index("fish") if "fish" in args.names else 0
     palette = sv.ColorPalette.DEFAULT
@@ -1099,63 +1405,40 @@ def main() -> None:
         'empty_queue_waits': 0
     }
 
-    pbar = tqdm(total=total_frames, desc="🔥 Pipeline Processing")
+    print(f"\n🎬 Process Results 시작\n")
     
-    # VPE 상태 변수
-    prev_vpe = None
+    pbar = tqdm(total=total_frames, desc="🔥 3-Stage Pipeline Processing")
 
-    # ────────────────── 🚀 PIPELINE MAIN LOOP 🚀 ───────────────── #
+    # ────────────────── 🚀 MAIN THREAD RESULT PROCESSING LOOP 🚀 ───────────────── #
     try:
         batch_idx = 0
         while True:
             try:
-                # Queue에서 배치 데이터 가져오기 (타임아웃 3초)
-                # print(f"\n🔍 Batch {batch_idx + 1} 대기 중... (Queue 크기: {batch_queue.qsize()})")
-                batch_data = batch_queue.get(timeout=3.0)
+                # Result Queue에서 처리 결과 가져오기 (타임아웃 3초)
+                result_data = result_queue.get(timeout=3.0)
                 
                 # 종료 신호 확인
-                if batch_data is None:
-                    print("🏁 Frame Loading Thread 종료 신호 수신")
+                if result_data is None:
+                    print("🏁 Main Thread: Inference Thread 종료 신호 수신")
                     break
                 
-                # 배치 데이터 언패킹
-                batch_frames = batch_data['batch_frames']
-                batch_indices = batch_data['batch_indices']
-                batch_original_frames = batch_data['batch_original_frames']
-                loaded_count = batch_data['loaded_count']
-                total_count = batch_data['total_count']
+                # 결과 데이터 언패킹
+                batch_results = result_data['batch_results']
+                batch_indices = result_data['batch_indices']
+                batch_original_frames = result_data['batch_original_frames']
+                loaded_count = result_data['loaded_count']
+                inference_batch_idx = result_data['batch_idx']
+                vpe_updated = result_data['vpe_updated']
+                prev_vpe_status = result_data['prev_vpe_status']
                 
-                # print(f"📦 Batch {batch_idx + 1}/{total_batches} 수신: {loaded_count}/{total_count} 프레임")
+                # print(f"📊 Main Thread: Batch {batch_idx + 1} 처리 시작 ({loaded_count} 프레임)")
                 
-                if not batch_frames:
-                    print("⚠️ 빈 batch 수신, 건너뛰기")
+                if not batch_results:
+                    print("⚠️ 빈 결과 수신, 건너뛰기")
                     batch_idx += 1
                     continue
                 
-                # ──────── 2. Batch inference ──────── #
-                batch_results = inference_batch(batch_frames, model, model_vp, prev_vpe, args)
-                
-                # ──────── 2.5. VPE 업데이트 ──────── #
-                if args.cross_vp:
-                    # print(f"🔄 Batch {batch_idx + 1}에서 다음 batch용 VPE 생성 중...")
-                    current_vpe = update_batch_vpe(batch_results, model_vp, args)
-                    
-                    if current_vpe is not None:
-                        if prev_vpe is None:
-                            # 첫 번째 VPE
-                            prev_vpe = current_vpe
-                            # print(f"🎯 첫 번째 VPE 설정 완료")
-                        else:
-                            # VPE Moving Average
-                            momentum = args.vpe_momentum
-                            prev_vpe = momentum * prev_vpe + (1 - momentum) * current_vpe
-                            # print(f"🔄 VPE Moving Average 업데이트 완료 (momentum={momentum})")
-                    else:
-                        print(f"⚠️ Batch {batch_idx + 1}에서 VPE 생성 실패, 이전 VPE 유지")
-                else:
-                    print(f"🚫 Cross-VP 비활성화됨, VPE 생성 건너뛰기")
-                
-                # ──────── 3. Batch 결과 처리 ──────── #
+                # ──────── 3. Batch 결과 처리 (CPU 작업) ──────── #
                 updated_state = process_batch_results(
                     batch_results, batch_indices, batch_original_frames,
                     tracker, args, fps, palette, person_class_id,
@@ -1167,7 +1450,9 @@ def main() -> None:
                     output_dir, out, log_file,
                     # 라인 크로싱 관련
                     p1, p2, seg_dx, seg_dy, seg_len2,
-                    width, height
+                    width, height,
+                    # Progress bar
+                    pbar
                 )
                 
                 # 상태 변수 업데이트
@@ -1182,52 +1467,54 @@ def main() -> None:
                 pipeline_stats['processed_batches'] += 1
                 pipeline_stats['processed_frames'] += loaded_count
                 
-                # Progress bar 업데이트 (프레임 단위)
-                pbar.update(loaded_count)  # 배치 내 실제 처리된 프레임 수만큼 업데이트
+                # Progress bar postfix 업데이트 (실제 update는 process_batch_results 내부에서 프레임 단위로)
                 elapsed_time = time.time() - pipeline_stats['start_time']
                 avg_fps = pipeline_stats['processed_frames'] / elapsed_time if elapsed_time > 0 else 0
-                vpe_status = "ON" if prev_vpe is not None else "OFF"
                 
-                # 현재 진행률 계산
-                progress_percent = (pipeline_stats['processed_frames'] / total_frames) * 100 if total_frames > 0 else 0
+                # 배치 완료 후 전체 통계 업데이트 (덜 빈번하게)
+                frame_queue_size = frame_queue.qsize()
+                result_queue_size = result_queue.qsize()
                 
-                pbar.set_postfix({
-                    # 'VPE': vpe_status,
-                    'FPS': f"{avg_fps:.1f}",
-                    # 'Progress': f"{progress_percent:.1f}%",
-                    # 'occupancy': current_occupancy,
-                    # 'congestion': f"{current_congestion}%",
-                    # 'forward': forward_cnt,
-                    # 'backward': backward_cnt,
-                    # 'Queue': f"{batch_queue.qsize()}/{max_queue_size}"
-                })
+                # 프레임별 postfix는 process_batch_results에서 처리되므로 여기서는 전체 통계만
+                pbar.set_description(f"🔥 Pipeline [FPS:{avg_fps:.1f}] [VPE:{'ON' if prev_vpe_status else 'OFF'}] [Q:{frame_queue_size}/{result_queue_size}]")
                 
-                # print(f"✅ Batch {batch_idx + 1} 완료: {len(batch_results)} 프레임 처리 (평균 FPS: {avg_fps:.1f})")
+                # print(f"✅ Main Thread: Batch {batch_idx + 1} 완료 ({loaded_count} 프레임, VPE: {'Updated' if vpe_updated else 'Kept'})")
                 batch_idx += 1
                 
             except queue.Empty:
                 pipeline_stats['empty_queue_waits'] += 1
-                print(f"⏳ Queue 비어있음, 대기 중... ({pipeline_stats['empty_queue_waits']}회)")
+                # print(f"⏳ Result Queue 비어있음, 대기 중... ({pipeline_stats['empty_queue_waits']}회)")
                 
-                # Frame Loading Thread가 아직 살아있는지 확인
-                if not frame_loader.is_alive():
-                    print("💀 Frame Loading Thread 종료됨, Pipeline 종료")
+                # Inference Thread가 아직 살아있는지 확인
+                if not inference_thread.is_alive():
+                    print("💀 Inference Thread 종료됨, Main Thread 종료")
                     break
                     
                 continue
             
             except Exception as e:
-                print(f"💥 Pipeline 처리 중 오류: {e}")
+                print(f"💥 Main Thread 처리 중 오류: {e}")
                 import traceback
                 traceback.print_exc()
                 break
     
     finally:
-        # ──────── Pipeline 정리 ──────── #
-        print(f"\n🧹 Pipeline 정리 중...")
+        # ──────── 🧹 3-Stage Pipeline 정리 ──────── #
+        print(f"\n🧹 3-Stage Pipeline 정리 중...")
+        
+        # Inference Thread 종료
+        if inference_thread.is_alive():
+            print("🛑 Inference Thread 종료 요청...")
+            inference_thread.stop()
+            inference_thread.join(timeout=5.0)
+            if inference_thread.is_alive():
+                print("⚠️ Inference Thread 강제 종료 타임아웃")
+            else:
+                print("✅ Inference Thread 정상 종료")
         
         # Frame Loading Thread 종료
         if frame_loader.is_alive():
+            print("🛑 Frame Loading Thread 종료 요청...")
             frame_loader.stop()
             frame_loader.join(timeout=5.0)
             if frame_loader.is_alive():
@@ -1236,11 +1523,27 @@ def main() -> None:
                 print("✅ Frame Loading Thread 정상 종료")
         
         # Queue 정리
-        while not batch_queue.empty():
+        print("🗑️ Queue 정리 중...")
+        queue_cleanup_count = 0
+        
+        # Frame Queue 정리
+        while not frame_queue.empty():
             try:
-                batch_queue.get_nowait()
+                frame_queue.get_nowait()
+                queue_cleanup_count += 1
             except queue.Empty:
                 break
+        
+        # Result Queue 정리
+        while not result_queue.empty():
+            try:
+                result_queue.get_nowait()
+                queue_cleanup_count += 1
+            except queue.Empty:
+                break
+        
+        if queue_cleanup_count > 0:
+            print(f"🗑️ Queue에서 {queue_cleanup_count}개 미처리 데이터 정리됨")
 
     # ────────────────── 🎉 Pipeline 처리 완료 & 최종 통계 🎉 ───────────────── #
     total_elapsed_time = time.time() - pipeline_stats['start_time']
@@ -1253,7 +1556,7 @@ def main() -> None:
     print(f"   - 총 처리 시간: {total_elapsed_time:.1f}초")
     print(f"   - 평균 FPS: {final_avg_fps:.1f}")
     print(f"   - Queue 빈 대기 횟수: {pipeline_stats['empty_queue_waits']}")
-    print(f"   - VPE 상태: {'활성화' if prev_vpe is not None else '비활성화'}")
+    # print(f"   - VPE 상태: {'활성화' if prev_vpe is not None else '비활성화'}")
     print(f"   - Batch 크기: {batch_size}")
     print(f"   - Queue 크기: {max_queue_size}")
     print(f"   - Frame Loading 스레드 수: {args.frame_loading_threads}")
@@ -1263,16 +1566,18 @@ def main() -> None:
     print(f"   - 최종 congestion: {current_congestion}%")
     print(f"   - 라인 크로싱: forward {forward_cnt}, backward {backward_cnt}")
     
-    if args.cross_vp and prev_vpe is not None:
-        print(f"🧠 VPE 정보:")
-        print(f"   - VPE shape: {prev_vpe.shape}")
-        print(f"   - VPE dtype: {prev_vpe.dtype}")
-        print(f"   - Cross-VP 모드: 활성화")
+    # if args.cross_vp and prev_vpe is not None:
+    #     print(f"🧠 VPE 정보:")
+    #     print(f"   - VPE shape: {prev_vpe.shape}")
+    #     print(f"   - VPE dtype: {prev_vpe.dtype}")
+    #     print(f"   - Cross-VP 모드: 활성화")
+    
+# ──────── 스레드별 상세 통계 ──────── #
     
     # Frame Loading Thread 통계 출력
     if hasattr(frame_loader, 'stats'):
         loader_stats = frame_loader.stats
-        print(f"📦 Frame Loading Thread 통계:")
+        print(f"📦 Stage 1 - Frame Loading Thread 통계:")
         print(f"   - 로드된 배치 수: {loader_stats['total_batches_loaded']}")
         print(f"   - 로드된 프레임 수: {loader_stats['total_frames_loaded']}")
         print(f"   - 실패한 프레임 수: {loader_stats['failed_frames']}")
@@ -1282,6 +1587,33 @@ def main() -> None:
             success_rate = (loader_stats['total_frames_loaded'] / 
                           (loader_stats['total_frames_loaded'] + loader_stats['failed_frames'])) * 100
             print(f"   - 프레임 로딩 성공률: {success_rate:.1f}%")
+    
+    # Inference Thread 통계 출력
+    if hasattr(inference_thread, 'stats'):
+        inference_stats = inference_thread.stats
+        print(f"🧠 Stage 2 - Inference Thread 통계:")
+        print(f"   - 처리된 배치 수: {inference_stats['total_batches_processed']}")
+        print(f"   - 처리된 프레임 수: {inference_stats['total_frames_processed']}")
+        print(f"   - VPE 업데이트 횟수: {inference_stats['vpe_updates']}")
+        print(f"   - 실패한 배치 수: {inference_stats['failed_batches']}")
+        
+        # GPU 효율성 계산
+        if inference_stats['total_batches_processed'] > 0:
+            gpu_success_rate = ((inference_stats['total_batches_processed'] - inference_stats['failed_batches']) / 
+                              inference_stats['total_batches_processed']) * 100
+            vpe_update_rate = (inference_stats['vpe_updates'] / inference_stats['total_batches_processed']) * 100
+            print(f"   - GPU 추론 성공률: {gpu_success_rate:.1f}%")
+            print(f"   - VPE 업데이트 비율: {vpe_update_rate:.1f}%")
+    
+    print(f"📊 Stage 3 - Main Thread 통계:")
+    print(f"   - 처리 완료된 배치 수: {pipeline_stats['processed_batches']}")
+    print(f"   - 처리 완료된 프레임 수: {pipeline_stats['processed_frames']}")
+    print(f"   - Queue 대기 횟수: {pipeline_stats['empty_queue_waits']}")
+    
+    # 전체 Pipeline 효율성
+    if pipeline_stats['processed_frames'] > 0 and hasattr(loader_stats, 'total_frames_loaded'):
+        pipeline_efficiency = (pipeline_stats['processed_frames'] / loader_stats['total_frames_loaded']) * 100
+        print(f"   - Pipeline 전체 효율성: {pipeline_efficiency:.1f}%")
 
     pbar.close()
     cap.release()
