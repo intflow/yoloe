@@ -64,10 +64,10 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
-    parser.add_argument("--output", type=str, default="output",
+    parser.add_argument("--output", type=str, default=None,
                         help="Output directory (optional, defaults to input filename without extension)")
     # Logging
     parser.add_argument("--log-detections", type=bool, default=True,
@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str,
                         default="/works/samsung_prj/pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
+    # NOTE [args] text prompt
     parser.add_argument("--names", nargs="+",
                         default=["fish", "disco ball", "pig"],
                         help="Custom class names list (index order matters)")
@@ -525,6 +526,7 @@ def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
     
     # 반투명 내부 채우기를 위한 복사본 생성
     overlay = image.copy()
+    color = (255, 228, 0)
     
     for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
         try:
@@ -532,10 +534,22 @@ def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
             coords = np.array(polygon.exterior.coords, dtype=np.int32)
             
             # 색상 선택
-            color = (255, 228, 0)
             
             # 1. polygon 내부를 색으로 채우기 (overlay에만 - 나중에 투명도 적용)
             cv2.fillPoly(overlay, [coords], color)
+        
+        except Exception as e:
+            print(f"⚠️ ROI polygon 그리기 오류: {e}")
+    
+    # 2. 반투명 내부 채우기 블렌딩 (투명도 30%)
+    alpha = 0.4
+    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    
+    # 3. 테두리 그리기 (투명도 없이 원본 image에 직접)
+    for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
+        try:
+            coords = np.array(polygon.exterior.coords, dtype=np.int32)
+            cv2.polylines(image, [coords], isClosed=True, color=color, thickness=8)
             
             # ROI 이름과 접근 횟수 표시
             if roi_name in roi_stats:
@@ -557,21 +571,7 @@ def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
                              (text_x + text_w + 5, text_y + 5), color, -1)
                 
                 # 텍스트 (원본 image에 직접)
-                cv2.putText(image, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
-        
-        except Exception as e:
-            print(f"⚠️ ROI polygon 그리기 오류: {e}")
-    
-    # 2. 반투명 내부 채우기 블렌딩 (투명도 30%)
-    alpha = 0.4
-    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
-    
-    # 3. 테두리 그리기 (투명도 없이 원본 image에 직접)
-    for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
-        try:
-            coords = np.array(polygon.exterior.coords, dtype=np.int32)
-            color = (255, 0, 0)
-            cv2.polylines(image, [coords], isClosed=True, color=color, thickness=8)
+                cv2.putText(image, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)            
         except Exception as e:
             print(f"⚠️ ROI polygon 테두리 그리기 오류: {e}")
     
