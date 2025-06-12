@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
                         help="Enable cross visual prompt mode")
     parser.add_argument("--save-interval", type=int, default=150,
                         help="Interval for saving intermediate frames")
-    # Batch processing
+    # NOTE [args] Batch processing
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
                         help="Image brightness adjustment (-50 to 50)")
     parser.add_argument("--denoise", type=float, default=0.1,
                         help="Image denoising strength (0.0-1.0)")
-    # ROI (Region of Interest) Access Detection
+    # NOTE [args] ROI Access Detection
     parser.add_argument("--roi-zones", type=str, 
                         # default=None,
                         default="[[214,392,286,392,290,478,214,478],[864,387,945,383,947,465,869,468],[478,14,735,7,736,225,491,221]]",
@@ -143,6 +143,8 @@ def parse_args() -> argparse.Namespace:
                         help="Minimum bbox overlap ratio for ROI detection")
     parser.add_argument("--roi-mask-threshold", type=float, default=0.1,
                         help="Minimum mask overlap ratio for ROI detection")
+    parser.add_argument("--roi-exit-grace-time", type=float, default=2.0,
+                        help="Grace time in seconds before removing objects that left ROI")
     return parser.parse_args()
 
 
@@ -305,7 +307,7 @@ class ROIAccessManager:
     """ROI 접근 감지 및 통계 관리 클래스"""
     
     def __init__(self, roi_polygons, roi_names, detection_method, dwell_time, 
-                 bbox_threshold, mask_threshold, fps):
+                 bbox_threshold, mask_threshold, fps, exit_grace_time):
         self.roi_polygons = roi_polygons
         self.roi_names = roi_names
         self.detection_method = detection_method
@@ -313,9 +315,12 @@ class ROIAccessManager:
         self.bbox_threshold = bbox_threshold
         self.mask_threshold = mask_threshold
         self.fps = fps
+        self.exit_grace_time = exit_grace_time
         
         # 접근에 필요한 프레임 수 계산
         self.required_frames = int(dwell_time * fps)
+        # 퇴장 유예 프레임 수 계산
+        self.exit_grace_frames = int(exit_grace_time * fps)
         
         # 각 ROI별 통계
         self.roi_stats = {}
@@ -324,7 +329,8 @@ class ROIAccessManager:
                 'total_access': 0,
                 'accessed_labels': set(),
                 'track_access_count': {},  # {track_id: access_count}
-                'current_tracks': {}  # {track_id: {'enter_frame': frame, 'label': label, 'consecutive_frames': count}}
+                'current_tracks': {},  # {track_id: {'enter_frame': frame, 'label': label, 'consecutive_frames': count}}
+                'exit_pending_tracks': {}  # {track_id: {'exit_frame': frame, 'grace_frames_left': count}}
             }
         
         print(f"\n🎯 ROI Access Manager 초기화:")
@@ -332,6 +338,7 @@ class ROIAccessManager:
         print(f"   - ROI 이름: {roi_names}")
         print(f"   - 감지 방법: {detection_method}")
         print(f"   - 체류 시간: {dwell_time}초 ({self.required_frames} 프레임)")
+        print(f"   - 퇴장 유예 시간: {exit_grace_time}초 ({self.exit_grace_frames} 프레임)")
         print(f"   - bbox 임계값: {bbox_threshold}")
         print(f"   - mask 임계값: {mask_threshold}")
     
@@ -388,20 +395,60 @@ class ROIAccessManager:
                             'counted': False
                         }
             
-            # ROI에서 나간 객체들 제거
+            # ROI에서 나간 객체들 처리 (유예 시간 적용)
             tracks_to_remove = []
+            tracks_to_exit_pending = []
+            
+            # 1. 현재 ROI에 없는 객체들 확인
             for track_id in roi_stat['current_tracks']:
                 if track_id not in current_roi_tracks:
-                    tracks_to_remove.append(track_id)
+                    # ROI에서 나간 객체 → 퇴장 대기 상태로 이동
+                    if track_id not in roi_stat['exit_pending_tracks']:
+                        tracks_to_exit_pending.append(track_id)
+            
+            # 2. 퇴장 대기 상태로 이동
+            for track_id in tracks_to_exit_pending:
+                roi_stat['exit_pending_tracks'][track_id] = {
+                    'exit_frame': frame_idx,
+                    'grace_frames_left': self.exit_grace_frames
+                }
+                # current_tracks에서는 아직 제거하지 않음 (유예 기간 동안 유지)
+            
+            # 3. 퇴장 대기 중인 객체들의 유예 시간 감소
+            exit_pending_to_remove = []
+            for track_id in list(roi_stat['exit_pending_tracks'].keys()):
+                if track_id in current_roi_tracks:
+                    # 다시 ROI에 들어온 경우 → 퇴장 대기 취소
+                    del roi_stat['exit_pending_tracks'][track_id]
+                    # print(f"🔄 ROI 재진입: {roi_name} - track_id:{track_id}")
+                else:
+                    # 여전히 ROI 밖에 있는 경우 → 유예 시간 감소
+                    roi_stat['exit_pending_tracks'][track_id]['grace_frames_left'] -= 1
+                    
+                    if roi_stat['exit_pending_tracks'][track_id]['grace_frames_left'] <= 0:
+                        # 유예 시간 만료 → 완전 제거
+                        exit_pending_to_remove.append(track_id)
+                        tracks_to_remove.append(track_id)
+            
+            # 4. 유예 시간이 만료된 객체들 완전 제거
+            for track_id in exit_pending_to_remove:
+                del roi_stat['exit_pending_tracks'][track_id]
             
             for track_id in tracks_to_remove:
-                del roi_stat['current_tracks'][track_id]
+                if track_id in roi_stat['current_tracks']:
+                    del roi_stat['current_tracks'][track_id]
+                    # print(f"🚪 ROI 완전 퇴장: {roi_name} - track_id:{track_id} (유예 시간 만료)")
     
     def get_current_roi_tracks(self):
-        """현재 각 ROI에 있는 track_id들 반환"""
+        """현재 각 ROI에 있는 track_id들 반환 (퇴장 대기 중인 객체 포함)"""
         current_tracks = {}
         for roi_name, roi_stat in self.roi_stats.items():
-            current_tracks[roi_name] = list(roi_stat['current_tracks'].keys())
+            # 현재 ROI에 있는 객체들 + 퇴장 대기 중인 객체들 (유예 기간 동안은 여전히 ROI에 있는 것으로 간주)
+            active_tracks = set(roi_stat['current_tracks'].keys())
+            # 퇴장 대기 중인 객체들도 포함 (시각화 목적)
+            pending_tracks = set(roi_stat['exit_pending_tracks'].keys())
+            all_tracks = active_tracks.union(pending_tracks)
+            current_tracks[roi_name] = list(all_tracks)
         return current_tracks
     
     def get_statistics(self):
@@ -424,6 +471,8 @@ class ROIAccessManager:
             'roi_detection_method': self.detection_method,
             'dwell_time_seconds': self.dwell_time,
             'required_frames': self.required_frames,
+            'exit_grace_time_seconds': self.exit_grace_time,
+            'exit_grace_frames': self.exit_grace_frames,
             'bbox_threshold': self.bbox_threshold,
             'mask_threshold': self.mask_threshold,
             'roi_names': self.roi_names
@@ -1839,7 +1888,8 @@ def main() -> None:
                 dwell_time=args.roi_dwell_time,
                 bbox_threshold=args.roi_bbox_threshold,
                 mask_threshold=args.roi_mask_threshold,
-                fps=fps
+                fps=fps,
+                exit_grace_time=args.roi_exit_grace_time
             )
         else:
             print("⚠️ ROI zones 파싱 실패, ROI 기능 비활성화")
