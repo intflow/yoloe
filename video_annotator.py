@@ -145,6 +145,11 @@ def parse_args() -> argparse.Namespace:
                         help="Minimum mask overlap ratio for ROI detection")
     parser.add_argument("--roi-exit-grace-time", type=float, default=2.0,
                         help="Grace time in seconds before removing objects that left ROI")
+    # Output resolution
+    parser.add_argument("--output-width", type=int, default=1920,
+                        help="Output video width (if not set, uses input width)")
+    parser.add_argument("--output-height", type=int, default=1080,
+                        help="Output video height (if not set, uses input height)")
     return parser.parse_args()
 
 
@@ -1490,8 +1495,8 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                          # I/O 관련
                          output_dir, out, log_file,
                          # 라인 크로싱 관련
-                         p1, p2, seg_dx, seg_dy, seg_len2,
-                         width, height,
+                         p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
+                         width, height, output_width, output_height, scale_x, scale_y,
                          # Progress bar & Queue monitoring
                          pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None,
                          # ROI Access Detection
@@ -1561,21 +1566,59 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                     log_file.flush()
                     log_buffer.clear()
 
-        # 시각화
+        # 시각화 - 출력 해상도로 리사이즈
         frame_rgb = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
-        annotated = frame_rgb.copy()
-        if tracked_objects:
-            annotated = draw_objects_overlay(annotated, tracked_objects, palette)
         
-        # ROI 시각화
+        # 출력 해상도와 입력 해상도가 다르면 리사이즈
+        if output_width != width or output_height != height:
+            frame_rgb = cv2.resize(frame_rgb, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+        
+        annotated = frame_rgb.copy()
+        
+        # 객체 오버레이 (스케일링된 좌표로)
+        scaled_objects = []
+        if tracked_objects:
+            # 객체 좌표를 출력 해상도에 맞게 스케일링
+            for obj in tracked_objects:
+                scaled_obj = ObjectMeta(
+                    box=[obj.box[0] * scale_x, obj.box[1] * scale_y, 
+                         obj.box[2] * scale_x, obj.box[3] * scale_y],
+                    mask=None,  # 마스크는 별도 처리
+                    confidence=obj.confidence,
+                    class_id=obj.class_id,
+                    class_name=obj.class_name,
+                    track_id=obj.track_id
+                )
+                
+                # 마스크가 있으면 출력 해상도로 리사이즈
+                if obj.mask is not None:
+                    scaled_obj.mask = cv2.resize(obj.mask.astype(np.float32), 
+                                               (output_width, output_height), 
+                                               interpolation=cv2.INTER_LINEAR)
+                
+                scaled_objects.append(scaled_obj)
+            
+            annotated = draw_objects_overlay(annotated, scaled_objects, palette)
+        
+        # ROI 시각화 (출력 해상도에 맞게 스케일링)
         if roi_manager is not None:
-            # ROI polygon 그리기
-            annotated = draw_roi_polygons(annotated, roi_manager.roi_polygons, 
+            # ROI polygon을 출력 해상도에 맞게 스케일링
+            scaled_roi_polygons = []
+            for polygon in roi_manager.roi_polygons:
+                coords = np.array(polygon.exterior.coords)
+                scaled_coords = coords * [scale_x, scale_y]
+                from shapely.geometry import Polygon
+                scaled_polygon = Polygon(scaled_coords)
+                scaled_roi_polygons.append(scaled_polygon)
+            
+            # ROI polygon 그리기 (스케일링된 좌표로)
+            annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
                                         roi_manager.roi_names, roi_manager.roi_stats)
             
-            # ROI에 있는 객체들 하이라이트
-            annotated = highlight_roi_objects(annotated, tracked_objects, 
-                                            current_roi_tracks, palette)
+            # ROI에 있는 객체들 하이라이트 (스케일링된 객체로)
+            if tracked_objects:
+                annotated = highlight_roi_objects(annotated, scaled_objects, 
+                                                current_roi_tracks, palette)
 
         # Occupancy 업데이트
         raw_occupancy = int(np.sum(class_ids == person_class_id))
@@ -1610,10 +1653,10 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             if obj.track_id not in track_color:
                 track_color[obj.track_id] = palette.by_idx(obj.track_id).as_bgr()
 
-            # 라인 크로싱 체크
-            if p1 is not None and p2 is not None:
-                side_now = point_side((cx, cy), p1, p2)
-                t = ((cx - p1[0]) * seg_dx + (cy - p1[1]) * seg_dy) / seg_len2
+            # 라인 크로싱 체크 (입력 해상도 기준 좌표 사용)
+            if p1_input is not None and p2_input is not None:
+                side_now = point_side((cx, cy), p1_input, p2_input)
+                t = ((cx - p1_input[0]) * seg_dx + (cy - p1_input[1]) * seg_dy) / seg_len2
                 inside = 0.0 <= t <= 1.0
 
                 side_prev = track_side.get(obj.track_id, side_now)
@@ -1626,12 +1669,14 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                 if inside and side_now != 0:
                     track_side[obj.track_id] = side_now
 
-        # 라인 그리기
+        # 라인 그리기 (출력 해상도에 맞게 스케일링)
         if p1 is not None and p2 is not None:
+            line_thickness = 8
+            
             if line_crossed_this_frame:
-                cv2.line(annotated, p1, p2, (255, 0, 0), 8)
+                cv2.line(annotated, p1, p2, (255, 0, 0), line_thickness)
             else:
-                cv2.line(annotated, p1, p2, (255, 255, 255), 8)
+                cv2.line(annotated, p1, p2, (255, 255, 255), line_thickness)
 
             mid_x, mid_y = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
             dx, dy = p2[0] - p1[0], p2[1] - p1[1]
@@ -1640,7 +1685,7 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             mag = (perp_x**2 + perp_y**2) ** 0.5 or 1
             perp_x, perp_y = int(perp_x / mag * length), int(perp_y / mag * length)
             arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
-            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), 8, tipLength=0.6)
+            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), line_thickness, tipLength=0.6)
 
         # Overlay 정보 그리기 (ROI 정보 추가)
         overlay = [
@@ -1654,11 +1699,14 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         if roi_manager is not None:
             for roi_name, roi_stat in roi_manager.roi_stats.items():
                 overlay.append(f"[ROI] {roi_name}: {roi_stat['total_access']} accesses")
+        
+        # 오버레이 텍스트 크기
         x0, y0, dy = 30, 60, 50
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 1
         font_thickness = 2
         padding = 10
+        
         max_width = 0
         for txt in overlay:
             (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
@@ -1672,22 +1720,26 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             cv2.putText(annotated, txt, (x0, y0 + i * dy),
                         font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
 
-        # 히트맵 minimap
+        # 히트맵 minimap (출력 해상도에 맞게 조정)
         blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
         norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
         color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
 
+        # 미니맵 크기를 출력 해상도에 맞게 조정
         mini_w = 400
-        mini_h = int(height * mini_w / width)
+        mini_h = int(output_height * mini_w / output_width)
         mini_map = cv2.resize(color_hm, (mini_w, mini_h))
 
         margin = 20
-        x_start = width - mini_w - margin
+        x_start = output_width - mini_w - margin
         y_start = margin
-        roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
-        blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
-        annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
+        
+        # 경계 체크
+        if x_start >= 0 and y_start >= 0 and x_start + mini_w <= output_width and y_start + mini_h <= output_height:
+            roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
+            blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
+            annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
 
         # 중간 저장
         if frame_idx - updated_state['last_save_frame'] >= args.save_interval:
@@ -1767,8 +1819,25 @@ def main() -> None:
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video {args.source}")
 
-    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # 입력 해상도
+    input_width, input_height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps, total_frames = cap.get(cv2.CAP_PROP_FPS), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # 출력 해상도 설정 (args에서 지정하지 않으면 입력 해상도 사용)
+    output_width = args.output_width if args.output_width is not None else input_width
+    output_height = args.output_height if args.output_height is not None else input_height
+    
+    # 스케일링 비율 계산
+    scale_x = output_width / input_width
+    scale_y = output_height / input_height
+    
+    print(f"\n📺 해상도 설정:")
+    print(f"   - 입력 해상도: {input_width} x {input_height}")
+    print(f"   - 출력 해상도: {output_width} x {output_height}")
+    print(f"   - 스케일링 비율: x={scale_x:.3f}, y={scale_y:.3f}")
+    
+    # 기존 변수명 호환성을 위해 width, height는 입력 해상도로 유지 (내부 로직용)
+    width, height = input_width, input_height
 
     # Select frames to process
     frames_to_process = range(total_frames)
@@ -1837,14 +1906,20 @@ def main() -> None:
 
     # ─────────────── Counting line (pixel) ───── #
     if args.line_start is not None and args.line_end is not None:
-        p1 = (int(args.line_end[0]   * width),  int(args.line_end[1]   * height))
-        p2 = (int(args.line_start[0] * width),  int(args.line_start[1] * height))
+        # 입력 해상도 기준으로 라인 좌표 계산 (내부 로직용)
+        p1_input = (int(args.line_end[0]   * width),  int(args.line_end[1]   * height))
+        p2_input = (int(args.line_start[0] * width),  int(args.line_start[1] * height))
         
-        # 선분 벡터 및 길이² 계산
-        seg_dx, seg_dy = p2[0] - p1[0], p2[1] - p1[1]
+        # 출력 해상도 기준으로 라인 좌표 계산 (시각화용)
+        p1 = (int(args.line_end[0]   * output_width),  int(args.line_end[1]   * output_height))
+        p2 = (int(args.line_start[0] * output_width),  int(args.line_start[1] * output_height))
+        
+        # 선분 벡터 및 길이² 계산 (입력 해상도 기준, 내부 로직용)
+        seg_dx, seg_dy = p2_input[0] - p1_input[0], p2_input[1] - p1_input[1]
         seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy or 1
     else:
         p1 = p2 = None
+        p1_input = p2_input = None
         seg_dx = seg_dy = seg_len2 = 0
 
     # ─────────────── Runtime state ───────────── #
@@ -1909,10 +1984,10 @@ def main() -> None:
     last_save_frame = 0
     log_buffer = []  # 로그 버퍼
 
-    # 비디오 출력 설정
+    # 비디오 출력 설정 (출력 해상도 사용)
     out = cv2.VideoWriter(output_video,
                         cv2.VideoWriter_fourcc(*'mp4v'),
-                        fps, (width, height))
+                        fps, (output_width, output_height))
 
     # Pipeline 통계
     pipeline_stats = {
@@ -1966,8 +2041,8 @@ def main() -> None:
                     # I/O 관련
                     output_dir, out, log_file,
                     # 라인 크로싱 관련
-                    p1, p2, seg_dx, seg_dy, seg_len2,
-                    width, height,
+                    p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
+                    width, height, output_width, output_height, scale_x, scale_y,
                     # Progress bar & Queue monitoring
                     pbar, frame_queue, result_queue, pipeline_stats,
                     # ROI Access Detection
