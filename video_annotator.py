@@ -17,6 +17,8 @@ from collections import defaultdict
 import threading
 import queue
 import time
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -56,7 +58,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -442,12 +445,16 @@ class InferenceThread(threading.Thread):
         except Exception as e:
             print(f"💥 Inference Thread 치명적 오류: {e}")
         finally:
-            # 종료 신호를 Result Queue에 전달 (아직 전달하지 않았다면)
-            try:
-                self.result_queue.put(None, timeout=1.0)
-                print("🏁 Inference Thread 종료 신호 Result Queue에 전달")
-            except queue.Full:
-                print("⚠️ Result Queue 가득 차서 종료 신호 전달 실패")
+            # 종료 신호를 Result Queue에 반드시 전달 (Queue가 빌 때까지 대기)
+            print("📤 Inference Thread 종료 신호 전송 준비 중...")
+            while True:
+                try:
+                    self.result_queue.put(None, timeout=1.0)
+                    print("🏁 Inference Thread 종료 신호 Result Queue에 전달 완료!")
+                    break
+                except queue.Full:
+                    print("⏳ Result Queue 가득함, 종료 신호 전송을 위해 대기 중...")
+                    time.sleep(0.1)
             
             print(f"📈 Inference Thread 최종 통계:")
             print(f"   - 처리된 배치 수: {self.stats['total_batches_processed']}")
@@ -605,10 +612,18 @@ class InferenceThread(threading.Thread):
 # ─────────────────────── Frame Loading Thread Class ────────────────────────────── #
 class FrameLoadingThread(threading.Thread):
     """
-    🚀 비디오 프레임을 지속적으로 로드하여 배치 단위로 Queue에 저장하는 스레드
+    🚀 Producer-Consumer 패턴으로 개선된 프레임 로딩 스레드
+    
+    구조:
+    1. VideoCapture는 초기화 시 한 번만 생성
+    2. 내부 읽기 스레드가 지속적으로 프레임 읽기
+    3. 프레임 버퍼에 frame_id와 함께 저장
+    4. 배치 구성 시 버퍼에서 꺼내서 사용 (즉시 삭제)
+    5. 최대 버퍼 크기로 메모리 제어
     """
     
-    def __init__(self, video_source, total_frames, batch_size, args, batch_queue, max_queue_size=5):
+    def __init__(self, video_source, total_frames, batch_size, args, batch_queue, 
+                 max_queue_size=3, max_buffer_size=200):
         super().__init__(daemon=True)
         self.video_source = video_source
         self.total_frames = total_frames
@@ -616,31 +631,238 @@ class FrameLoadingThread(threading.Thread):
         self.args = args
         self.batch_queue = batch_queue
         self.max_queue_size = max_queue_size
+        self.max_buffer_size = max_buffer_size  # 프레임 버퍼 최대 크기
+        
+        # 상태 관리
         self.current_frame = 0
         self.stop_event = threading.Event()
+        self.queue_full_print = False
+        
+        # 🎯 핵심: 프레임 버퍼 (Producer-Consumer)
+        self.frame_buffer = {}  # {frame_id: frame_data}
+        self.buffer_lock = threading.Lock()
+        self.buffer_not_full = threading.Condition(self.buffer_lock)
+        self.frames_available = threading.Condition(self.buffer_lock)
+        
+        # 통계
         self.stats = {
             'total_batches_loaded': 0,
             'total_frames_loaded': 0,
-            'failed_frames': 0
+            'failed_frames': 0,
+            'buffer_waits': 0,
+            'max_buffer_used': 0
         }
         
-        self.queue_full_print = False
+        # VideoCapture 초기화 (한 번만!)
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"VideoCapture 열기 실패: {self.video_source}")
+        
+        # 내부 프레임 읽기 스레드 생성
+        self.reader_thread = threading.Thread(target=self._continuous_frame_reader, daemon=True)
+        self.reader_started = False
         
         print(f"\n🎬 Frame Loading Thread 초기화:")
         print(f"   - 총 프레임: {total_frames}")
         print(f"   - 배치 크기: {batch_size}")
         print(f"   - Queue 최대 크기: {max_queue_size}")
-        print(f"   - 로딩 스레드 수: {args.frame_loading_threads}")
+        print(f"   - 프레임 버퍼 최대 크기: {max_buffer_size}")
+        print(f"   - VideoCapture: 초기화 완료 ✅")
     
     def stop(self):
         """스레드 종료 요청"""
         self.stop_event.set()
+        # 모든 대기 중인 스레드 깨우기
+        with self.buffer_lock:
+            self.buffer_not_full.notify_all()
+            self.frames_available.notify_all()
         print("🛑 Frame Loading Thread 종료 요청됨")
     
-    # ANCHOR Load Batch Frames
+    def _continuous_frame_reader(self):
+        """
+        🔄 Producer: 지속적으로 프레임을 읽어서 버퍼에 저장
+        별도 스레드에서 실행되며 VideoCapture를 독점 사용
+        """
+        print("📖 Start Continuous Frame Reader")
+        
+        frame_idx = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 10
+        
+        try:
+            while not self.stop_event.is_set() and frame_idx < self.total_frames:
+                # 버퍼 크기 체크 및 대기
+                with self.buffer_lock:
+                    while (len(self.frame_buffer) >= self.max_buffer_size and 
+                           not self.stop_event.is_set()):
+                        self.stats['buffer_waits'] += 1
+                        # print(f"⏳ 프레임 버퍼 가득참 ({len(self.frame_buffer)}/{self.max_buffer_size}), 대기 중...")
+                        self.buffer_not_full.wait(timeout=1.0)
+                
+                if self.stop_event.is_set():
+                    break
+                
+                # 프레임 읽기
+                ok, frame_bgr = self.cap.read()
+                
+                if ok:
+                    # 성공적으로 읽음
+                    consecutive_failures = 0
+                    
+                    # 버퍼에 저장
+                    with self.buffer_lock:
+                        self.frame_buffer[frame_idx] = {
+                            'frame': frame_bgr.copy(),
+                            'frame_idx': frame_idx
+                        }
+                        
+                        # 통계 업데이트
+                        current_buffer_size = len(self.frame_buffer)
+                        self.stats['max_buffer_used'] = max(self.stats['max_buffer_used'], 
+                                                          current_buffer_size)
+                        
+                        # Consumer에게 프레임 준비됨 알림
+                        self.frames_available.notify_all()
+                    
+                    frame_idx += 1
+                    
+                    # # 주기적 상태 출력 (1000 프레임마다)
+                    # if frame_idx % 1000 == 0:
+                    #     with self.buffer_lock:
+                    #         buffer_size = len(self.frame_buffer)
+                    #     print(f"📖 프레임 읽기 진행: {frame_idx}/{self.total_frames} "
+                    #           f"(버퍼: {buffer_size}/{self.max_buffer_size})")
+                
+                else:
+                    # 읽기 실패
+                    consecutive_failures += 1
+                    self.stats['failed_frames'] += 1
+                    
+                    # if consecutive_failures >= max_consecutive_failures:
+                    #     print(f"💥 연속 {consecutive_failures}회 프레임 읽기 실패, 중단")
+                    #     break
+                    
+                    print(f"⚠️ 프레임 {frame_idx} 읽기 실패 ({consecutive_failures}/{max_consecutive_failures})")
+                    frame_idx += 1  # 다음 프레임으로 계속
+                
+        except Exception as e:
+            print(f"💥 연속 프레임 읽기 오류: {e}")
+        finally:
+            print(f"📖 연속 프레임 읽기 종료: {frame_idx} 프레임 처리 완료")
+            # Consumer들에게 종료 알림
+            with self.buffer_lock:
+                self.frames_available.notify_all()
+    
+    def _load_batch_frames(self, start_frame, end_frame):
+        """
+        🛒 Consumer: 버퍼에서 필요한 프레임들을 꺼내서 배치 구성
+        사용된 프레임은 즉시 삭제하여 메모리 효율성 확보
+        """
+        batch_size = end_frame - start_frame
+        raw_frames = {}
+        
+        # 1단계: 버퍼에서 필요한 프레임들 수집
+        for frame_idx in range(start_frame, end_frame):
+            frame_data = None
+            max_wait_attempts = 50  # 최대 5초 대기 (100ms × 50)
+            
+            for attempt in range(max_wait_attempts):
+                with self.buffer_lock:
+                    if frame_idx in self.frame_buffer:
+                        # 프레임 찾음 → 즉시 꺼내서 삭제 (핵심!)
+                        frame_data = self.frame_buffer.pop(frame_idx)
+                        
+                        # Producer에게 버퍼 공간 생김 알림
+                        self.buffer_not_full.notify()
+                        break
+                    else:
+                        # 프레임 아직 없음 → 잠시 대기
+                        self.frames_available.wait(timeout=0.1)
+                
+                if self.stop_event.is_set():
+                    break
+            
+            if frame_data is not None:
+                raw_frames[frame_idx] = frame_data['frame']
+            else:
+                print(f"⚠️ 프레임 {frame_idx} 버퍼에서 찾을 수 없음 (타임아웃)")
+                self.stats['failed_frames'] += 1
+        
+        if not raw_frames:
+            print("💥 버퍼에서 읽은 프레임이 없음")
+            return None
+        
+        # print(f"   🛒 버퍼에서 수집: {len(raw_frames)}/{batch_size} 프레임")
+        
+        # 2단계: 병렬 전처리 (기존 로직 유지)
+        processed_frames = {}
+        lock = threading.Lock()
+        
+        def preprocess_single_frame(frame_idx, frame_bgr):
+            """단일 프레임 전처리 (스레드에서 실행)"""
+            try:
+                # RGB 변환 및 전처리 (CPU 집약적)
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = preprocess_image(frame_rgb, self.args)
+                
+                # PIL Image로 변환
+                pil_frame = Image.fromarray(frame_rgb)
+                
+                # 스레드 세이프하게 저장
+                with lock:
+                    processed_frames[frame_idx] = {
+                        'pil_frame': pil_frame,
+                        'original_frame': frame_bgr,
+                        'success': True
+                    }
+                    
+            except Exception as e:
+                with lock:
+                    processed_frames[frame_idx] = {'success': False, 'error': str(e)}
+                print(f"💥 프레임 {frame_idx} 전처리 실패: {e}")
+        
+        # 병렬 전처리 실행
+        max_workers = min(self.args.frame_loading_threads, len(raw_frames))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(preprocess_single_frame, frame_idx, frame_bgr) 
+                for frame_idx, frame_bgr in raw_frames.items()
+            ]
+            concurrent.futures.wait(futures)
+        
+        # 3단계: 결과 정리 (인덱스 순서대로)
+        batch_frames = []
+        batch_indices = []
+        batch_original_frames = []
+        
+        loaded_count = 0
+        for frame_idx in range(start_frame, end_frame):
+            if frame_idx in processed_frames and processed_frames[frame_idx]['success']:
+                batch_frames.append(processed_frames[frame_idx]['pil_frame'])
+                batch_indices.append(frame_idx)
+                batch_original_frames.append(processed_frames[frame_idx]['original_frame'])
+                loaded_count += 1
+        
+        if loaded_count == 0:
+            return None
+        
+        return {
+            'batch_frames': batch_frames,
+            'batch_indices': batch_indices,
+            'batch_original_frames': batch_original_frames,
+            'loaded_count': loaded_count,
+            'total_count': batch_size
+        }
+    
+    # ANCHOR Main Thread Run
     def run(self):
-        """메인 프레임 로딩 루프"""
+        """메인 배치 로딩 루프 (Consumer)"""
         print("\n🚀 Frame Loading Thread 시작!")
+        
+        # 내부 프레임 읽기 스레드 시작
+        if not self.reader_started:
+            self.reader_thread.start()
+            self.reader_started = True
         
         try:
             while not self.stop_event.is_set() and self.current_frame < self.total_frames:
@@ -656,8 +878,6 @@ class FrameLoadingThread(threading.Thread):
                 batch_start = self.current_frame
                 batch_end = min(batch_start + self.batch_size, self.total_frames)
                 
-                # print(f"📦 배치 로딩 시작: 프레임 {batch_start}-{batch_end-1}")
-                
                 batch_data = self._load_batch_frames(batch_start, batch_end)
                 
                 if batch_data is not None:
@@ -667,321 +887,93 @@ class FrameLoadingThread(threading.Thread):
                     self.stats['total_frames_loaded'] += len(batch_data['batch_indices'])
                     
                     # print(f"✅ 배치 로딩 완료: {len(batch_data['batch_indices'])} 프레임 → Queue에 저장")
-                    # print(f"📊 현재 Queue 크기: {self.batch_queue.qsize()}/{self.max_queue_size}")
                 else:
                     print(f"❌ 배치 로딩 실패: 프레임 {batch_start}-{batch_end-1}")
                 
                 self.current_frame = batch_end
                 self.queue_full_print = False
                 
+            print(f"🔄 현재 프레임: {self.current_frame}/{self.total_frames}")
+                
         except Exception as e:
             print(f"💥 Frame Loading Thread 오류: {e}")
         finally:
-            # 종료 신호를 Queue에 전달
-            try:
-                self.batch_queue.put(None, timeout=1.0)  # None은 종료 신호
-                print("🏁 Frame Loading Thread 종료 신호 전달")
-            except queue.Full:
-                print("⚠️ Queue가 가득 차서 종료 신호 전달 실패")
+            # 종료 신호를 Queue에 반드시 전달 (Queue가 빌 때까지 대기)
+            print("📤 종료 신호 전송 준비 중...")
+            while True:
+                try:
+                    self.batch_queue.put(None, timeout=1.0)  # None은 종료 신호
+                    print("🏁 Frame Loading Thread 종료 신호 전달 완료!")
+                    break
+                except queue.Full:
+                    print("⏳ Queue 가득참, 종료 신호 전송을 위해 대기 중...")
+                    time.sleep(0.1)
             
+            # 내부 스레드 정리
+            if self.reader_started and self.reader_thread.is_alive():
+                print("🛑 내부 프레임 읽기 스레드 종료 대기...")
+                self.reader_thread.join(timeout=3.0)
+                if self.reader_thread.is_alive():
+                    print("⚠️ 내부 프레임 읽기 스레드 강제 종료 타임아웃")
+                else:
+                    print("✅ 내부 프레임 읽기 스레드 정상 종료")
+            
+            # VideoCapture 정리
+            if self.cap.isOpened():
+                self.cap.release()
+                print("🎬 VideoCapture 해제 완료")
+            
+            # 최종 통계 출력
             print(f"📈 Frame Loading Thread 최종 통계:")
             print(f"   - 로드된 배치 수: {self.stats['total_batches_loaded']}")
             print(f"   - 로드된 프레임 수: {self.stats['total_frames_loaded']}")
             print(f"   - 실패한 프레임 수: {self.stats['failed_frames']}")
-    
-    def _load_batch_frames(self, start_frame, end_frame):
-        """실제 배치 프레임 로딩 (기존 load_batch_frames 로직 활용)"""
-        import concurrent.futures
-        from concurrent.futures import ThreadPoolExecutor
-        
-        batch_size = end_frame - start_frame
-        
-        # 스레드 세이프한 프레임 데이터 저장
-        frame_data = {}
-        lock = threading.Lock()
-        
-        def load_single_frame(frame_idx):
-            """단일 프레임 로딩 (스레드에서 실행)"""
-            try:
-                # 각 스레드마다 별도의 VideoCapture 사용 (스레드 세이프)
-                thread_cap = cv2.VideoCapture(self.video_source)
-                thread_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ok, frame_bgr = thread_cap.read()
-                thread_cap.release()
-                
-                if ok:
-                    # RGB 변환 및 전처리
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    frame_rgb = preprocess_image(frame_rgb, self.args)
-                    
-                    # PIL Image로 변환
-                    pil_frame = Image.fromarray(frame_rgb)
-                    
-                    # 스레드 세이프하게 저장
-                    with lock:
-                        frame_data[frame_idx] = {
-                            'pil_frame': pil_frame,
-                            'original_frame': frame_bgr.copy(),
-                            'success': True
-                        }
-                else:
-                    with lock:
-                        frame_data[frame_idx] = {'success': False}
-                        
-            except Exception as e:
-                with lock:
-                    frame_data[frame_idx] = {'success': False, 'error': str(e)}
-                    self.stats['failed_frames'] += 1
-        
-        # 멀티스레딩으로 프레임 로딩
-        max_workers = min(self.args.frame_loading_threads, batch_size)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            frame_indices = list(range(start_frame, end_frame))
-            futures = [executor.submit(load_single_frame, idx) for idx in frame_indices]
-            concurrent.futures.wait(futures)
-        
-        # 결과 정리 (인덱스 순서대로)
-        batch_frames = []
-        batch_indices = []
-        batch_original_frames = []
-        
-        loaded_count = 0
-        for frame_idx in range(start_frame, end_frame):
-            if frame_idx in frame_data and frame_data[frame_idx]['success']:
-                batch_frames.append(frame_data[frame_idx]['pil_frame'])
-                batch_indices.append(frame_idx)
-                batch_original_frames.append(frame_data[frame_idx]['original_frame'])
-                loaded_count += 1
-        
-        if loaded_count == 0:
-            return None
-        
-        return {
-            'batch_frames': batch_frames,
-            'batch_indices': batch_indices,
-            'batch_original_frames': batch_original_frames,
-            'loaded_count': loaded_count,
-            'total_count': batch_size
-        }
-
-# def load_batch_frames(cap, start_frame, end_frame, args):
-#     """지정된 범위의 프레임들을 멀티스레딩으로 배치 로드"""
-#     import concurrent.futures
-#     import threading
-#     from concurrent.futures import ThreadPoolExecutor
-    
-#     batch_size = end_frame - start_frame
-#     print(f"   📂 프레임 {start_frame}-{end_frame-1} 로딩 중... (배치 크기: {batch_size}, 스레드: {min(args.frame_loading_threads, batch_size)}개)")
-    
-#     # 스레드 세이프한 프레임 데이터 저장
-#     frame_data = {}
-#     lock = threading.Lock()
-    
-#     def load_single_frame(frame_idx):
-#         """단일 프레임 로딩 (스레드에서 실행)"""
-#         try:
-#             # 각 스레드마다 별도의 VideoCapture 사용 (스레드 세이프)
-#             thread_cap = cv2.VideoCapture(args.source)
-#             thread_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-#             ok, frame_bgr = thread_cap.read()
-#             thread_cap.release()
+            print(f"   - 버퍼 대기 횟수: {self.stats['buffer_waits']}")
+            print(f"   - 최대 버퍼 사용량: {self.stats['max_buffer_used']}/{self.max_buffer_size}")
             
-#             if ok:
-#                 # RGB 변환 및 전처리
-#                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-#                 frame_rgb = preprocess_image(frame_rgb, args)
-                
-#                 # PIL Image로 변환
-#                 pil_frame = Image.fromarray(frame_rgb)
-                
-#                 # 스레드 세이프하게 저장
-#                 with lock:
-#                     frame_data[frame_idx] = {
-#                         'pil_frame': pil_frame,
-#                         'original_frame': frame_bgr.copy(),
-#                         'success': True
-#                     }
-                    
-#                     # 진행 상황 출력 (10% 단위)
-#                     loaded_count = len(frame_data)
-#                     if loaded_count % max(1, batch_size // 10) == 0:
-#                         progress = (loaded_count / batch_size) * 100
-#                         print(f"     📊 프레임 로딩 진행률: {progress:.0f}% ({loaded_count}/{batch_size})")
-#             else:
-#                 with lock:
-#                     frame_data[frame_idx] = {'success': False}
-                    
-#         except Exception as e:
-#             with lock:
-#                 frame_data[frame_idx] = {'success': False, 'error': str(e)}
+            # 버퍼 효율성 계산
+            if self.stats['total_frames_loaded'] > 0:
+                success_rate = (self.stats['total_frames_loaded'] / 
+                              (self.stats['total_frames_loaded'] + self.stats['failed_frames'])) * 100
+                buffer_efficiency = (self.stats['max_buffer_used'] / self.max_buffer_size) * 100
+                print(f"   - 프레임 로딩 성공률: {success_rate:.1f}%")
+                print(f"   - 버퍼 사용 효율성: {buffer_efficiency:.1f}%")
     
-#     # 멀티스레딩으로 프레임 로딩 (사용자 설정 스레드 수 사용)
-#     max_workers = min(args.frame_loading_threads, batch_size)  # 배치 크기보다 많은 스레드는 불필요
-#     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-#         # 모든 프레임 인덱스에 대해 병렬 처리
-#         frame_indices = list(range(start_frame, end_frame))
-#         futures = [executor.submit(load_single_frame, idx) for idx in frame_indices]
-        
-#         # 모든 스레드 완료 대기
-#         concurrent.futures.wait(futures)
-    
-#     # 결과 정리 (인덱스 순서대로)
-#     batch_frames = []
-#     batch_indices = []
-#     batch_original_frames = []
-    
-#     loaded_count = 0
-#     for frame_idx in range(start_frame, end_frame):
-#         if frame_idx in frame_data and frame_data[frame_idx]['success']:
-#             batch_frames.append(frame_data[frame_idx]['pil_frame'])
-#             batch_indices.append(frame_idx)
-#             batch_original_frames.append(frame_data[frame_idx]['original_frame'])
-#             loaded_count += 1
-    
-#     print(f"   ✅ 프레임 로딩 완료: {loaded_count}/{batch_size} 성공 ({(loaded_count/batch_size)*100:.1f}%)")
-    
-#     return batch_frames, batch_indices, batch_original_frames
-
-# def inference_batch(batch_frames, model, model_vp, prev_vpe, args):
-#     """Batch 단위로 inference 수행"""
-    
-#     batch_size = len(batch_frames)
-#     # print(f"   🧠 배치 추론 시작: {batch_size}개 프레임 처리")
-    
-#     if prev_vpe is not None and args.cross_vp:
-#         # print(f"   🎯 VPE 모드로 추론 중...")
-#         # 이전 batch의 VPE를 현재 batch에 적용
-#         model_vp.set_classes(args.names, prev_vpe)
-#         model_vp.predictor = None
-        
-#         # Batch inference with VPE
-#         results = model_vp.predict(
-#             source=batch_frames,  # 리스트로 전달하면 batch 처리됨
-#             imgsz=args.image_size,
-#             conf=args.conf_thresh,
-#             iou=args.iou_thresh,
-#             verbose=False
-#         )
-#         # print(f"   ✅ VPE 추론 완료: {len(results)}개 결과 생성")
-#     else:
-#         # print(f"   🔍 기본 모드로 추론 중...")
-#         # 첫 번째 batch 또는 VPE 없이 처리
-#         results = model.predict(
-#             source=batch_frames,
-#             imgsz=args.image_size,
-#             conf=0.05,
-#             iou=args.iou_thresh,
-#             verbose=False
-#         )
-#         # print(f"   ✅ 기본 추론 완료: {len(results)}개 결과 생성")
-    
-#     return results
 
 
-# ANCHOR Update Batch VPE
-def update_batch_vpe(batch_results, model_vp, args):
-    """Batch 결과에서 VPE 생성 및 평균화"""
-    
-    high_conf_prompts = []
-    
-    # print(f"🔍 VPE 생성을 위한 high-confidence detection 수집 중...")
-    
-    # Batch 내 모든 프레임에서 high-confidence detection 수집
-    for i, result in enumerate(batch_results):
-        if len(result.boxes) > 0:
-            confidences = result.boxes.conf.cpu().numpy()
-            boxes = result.boxes.xyxy.cpu().numpy()
-            class_ids = result.boxes.cls.cpu().numpy()
-            
-            high_conf_mask = confidences >= args.vp_thresh
-            
-            if np.any(high_conf_mask):
-                # High confidence detection을 프롬프트로 사용
-                prompt_data = {
-                    "bboxes": boxes[high_conf_mask],
-                    "cls": class_ids[high_conf_mask],
-                    "frame": result.orig_img,  # 원본 이미지 정보
-                    "frame_idx": i
-                }
-                
-                # 모든 클래스가 포함되도록 추가
-                for cls_idx in range(len(args.names)):
-                    if cls_idx not in class_ids:
-                        prompt_data["bboxes"] = np.append(prompt_data["bboxes"], [[0, 0, 0, 0]], axis=0)
-                        prompt_data["cls"] = np.append(prompt_data["cls"], [cls_idx])                
-                        
-                high_conf_prompts.append(prompt_data)
-                # print(f"   프레임 {i}: {len(boxes[high_conf_mask])} 개의 high-conf detection 수집")
-                
-    if high_conf_prompts:
-        # print(f"✅ 총 {len(high_conf_prompts)} 프레임에서 프롬프트 수집 완료")
-        # Batch 내 프롬프트들로 VPE 생성
-        batch_vpe = generate_batch_vpe(high_conf_prompts, model_vp, args)
-        return batch_vpe
-    else:
-        print("⚠️ High-confidence detection이 없어 VPE 생성 불가")
-        return None
 
-# ANCHOR VPE Generation
-def generate_batch_vpe(prompts_list, model_vp, args):
-    """여러 프롬프트에서 VPE를 배치로 생성 후 평균화"""
+# ───────────────────────────── Main ───────────────────────────────────── #
+def preprocess_image(image, args):
+    """이미지 전처리 함수"""
+    # 이미지를 float32로 변환
+    img = image.astype(np.float32)
     
-    # print(f"🧠 {len(prompts_list)} 개 프롬프트에서 배치 VPE 생성 중...")
+    # 선명도 향상
+    if args.sharpen > 0:
+        kernel = np.array([[-1,-1,-1],
+                          [-1, 9,-1],
+                          [-1,-1,-1]]) * args.sharpen
+        img = cv2.filter2D(img, -1, kernel)
     
-    # 배치용 이미지와 프롬프트 준비
-    batch_images = []
-    batch_prompts = {"bboxes": [], "cls": []}
+    # 대비 조정
+    if args.contrast != 1.0:
+        img = cv2.convertScaleAbs(img, alpha=args.contrast, beta=0)
     
-    for i, prompt_data in enumerate(prompts_list):
-        # 이미지 준비
-        frame_rgb = cv2.cvtColor(prompt_data["frame"], cv2.COLOR_BGR2RGB)
-        batch_images.append(Image.fromarray(frame_rgb))
-        
-        # 프롬프트 준비
-        batch_prompts["bboxes"].append(prompt_data["bboxes"])
-        batch_prompts["cls"].append(prompt_data["cls"])
+    # 밝기 조정
+    if args.brightness != 0:
+        img = cv2.convertScaleAbs(img, alpha=1.0, beta=args.brightness)
     
-    try:
-        # 배치 VPE 생성 (한 번의 호출로 모든 프롬프트 처리)
-        # print(f"   📦 {len(batch_images)} 개 이미지를 배치로 VPE 생성 중...")
-        
-        model_vp.predictor = None  # VPE 생성 전 초기화
-        model_vp.predict(
-            source=batch_images,  # ← 배치 이미지 리스트
-            prompts=batch_prompts,  # ← 배치 프롬프트
-            predictor=YOLOEVPSegPredictor,
-            return_vpe=True,
-            imgsz=args.image_size,
-            conf=args.vp_thresh,
-            iou=args.iou_thresh,
-            verbose=False
-        )
-        
-        # VPE 추출
-        if hasattr(model_vp, 'predictor') and hasattr(model_vp.predictor, 'vpe'):
-            batch_vpe = model_vp.predictor.vpe
-            # print(f"     ✅ 배치 VPE 생성 성공 (shape: {batch_vpe.shape})")
-            
-            # 배치 차원을 평균화하여 단일 VPE로 변환
-            if len(batch_vpe.shape) > 2:  # (batch_size, classes, features) 형태인 경우
-                averaged_vpe = batch_vpe.mean(dim=0, keepdim=True)  # (1, classes, features)
-                # print(f"     🔄 배치 VPE 평균화: {batch_vpe.shape} → {averaged_vpe.shape}")
-            else:
-                averaged_vpe = batch_vpe
-            
-            # 예측기 정리
-            model_vp.predictor = None
-            
-            return averaged_vpe
-        else:
-            print(f"     ❌ 배치 VPE 생성 실패 - predictor 또는 vpe 속성 없음")
-            model_vp.predictor = None
-            return None
-            
-    except Exception as e:
-        print(f"     ❌ 배치 VPE 생성 중 오류: {e}")
-        model_vp.predictor = None
-        return None
+    # 노이즈 제거
+    if args.denoise > 0:
+        img = cv2.fastNlMeansDenoisingColored(img, None, 
+                                             h=args.denoise*10, 
+                                             hColor=args.denoise*10, 
+                                             templateWindowSize=7, 
+                                             searchWindowSize=21)
+    
+    # 값 범위를 0-255로 제한
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    return img
 
 # ANCHOR Detection Result Processing
 def process_batch_results(batch_results, batch_indices, batch_original_frames, 
@@ -1198,40 +1190,6 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             #     })
     
     return updated_state
-
-
-# ───────────────────────────── Main ───────────────────────────────────── #
-def preprocess_image(image, args):
-    """이미지 전처리 함수"""
-    # 이미지를 float32로 변환
-    img = image.astype(np.float32)
-    
-    # 선명도 향상
-    if args.sharpen > 0:
-        kernel = np.array([[-1,-1,-1],
-                          [-1, 9,-1],
-                          [-1,-1,-1]]) * args.sharpen
-        img = cv2.filter2D(img, -1, kernel)
-    
-    # 대비 조정
-    if args.contrast != 1.0:
-        img = cv2.convertScaleAbs(img, alpha=args.contrast, beta=0)
-    
-    # 밝기 조정
-    if args.brightness != 0:
-        img = cv2.convertScaleAbs(img, alpha=1.0, beta=args.brightness)
-    
-    # 노이즈 제거
-    if args.denoise > 0:
-        img = cv2.fastNlMeansDenoisingColored(img, None, 
-                                             h=args.denoise*10, 
-                                             hColor=args.denoise*10, 
-                                             templateWindowSize=7, 
-                                             searchWindowSize=21)
-    
-    # 값 범위를 0-255로 제한
-    img = np.clip(img, 0, 255).astype(np.uint8)
-    return img
 
 def main() -> None:
     args = parse_args()
@@ -1624,7 +1582,6 @@ def main() -> None:
     out.release()
     
     print(f"\n✔ Pipeline 처리 완료! 저장 위치: {output_dir}")
-    print(f"🚀 총 성능 향상:** Frame Loading과 Inference가 병렬로 실행되어 처리 속도가 향상되었습니다!")
 
 
 if __name__ == "__main__":
