@@ -58,8 +58,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # I/O
-    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=150,
                         help="Interval for saving intermediate frames")
     # Batch processing
-    parser.add_argument("--batch-size", type=int, default=24,
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
@@ -138,30 +138,30 @@ def point_side(p, a, b) -> int:
 
 
 # ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
-def convert_results_to_objects(result, class_names) -> list[ObjectMeta]:
+def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
     """
-    YOLO 결과를 ObjectMeta 리스트로 변환 (Supervision 방식의 마스크 처리)
+    CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환
     """
     objects = []
     
-    if len(result.boxes) == 0:
+    if not cpu_result['has_boxes']:
         return objects
     
-    boxes = result.boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
-    confidences = result.boxes.conf.cpu().numpy()
-    class_ids = result.boxes.cls.cpu().numpy().astype(int)
+    boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
+    confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
+    class_ids = cpu_result['boxes_cls']  # 이미 CPU numpy array
     
-    # 마스크 정보 (있을 경우) - 정교한 변환 로직 사용
+    # 마스크 정보 처리 (정교한 변환 로직 사용)
     masks = None
-    if hasattr(result, 'masks') and result.masks is not None:
+    if cpu_result['masks_type'] is not None:
         try:
-            # Supervision 방식: masks.xy 사용 (이미 원본 좌표계로 변환됨)
-            if hasattr(result.masks, 'xy') and result.masks.xy is not None:
-                # masks.xy는 이미 원본 이미지 좌표계로 변환된 polygon 좌표들
-                orig_height, orig_width = result.orig_shape
+            orig_height, orig_width = cpu_result['orig_shape']
+            
+            if cpu_result['masks_type'] == 'xy':
+                # masks.xy 사용 (이미 원본 좌표계로 변환됨)
                 masks_list = []
                 
-                for mask_coords in result.masks.xy:
+                for mask_coords in cpu_result['masks_xy']:
                     # polygon을 마스크로 변환
                     mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
                     if len(mask_coords) > 0:
@@ -173,10 +173,9 @@ def convert_results_to_objects(result, class_names) -> list[ObjectMeta]:
                 
                 masks = np.array(masks_list)
                 
-            # xy가 없으면 data를 사용하되 더 정교한 변환 적용
-            elif hasattr(result.masks, 'data'):
-                orig_height, orig_width = result.orig_shape
-                mask_data = result.masks.data.cpu().numpy()  # [N, H, W]
+            elif cpu_result['masks_type'] == 'data':
+                # masks.data 사용
+                mask_data = cpu_result['masks_data']  # 이미 CPU numpy array
                 
                 # YOLO의 이미지 전처리 정보 계산
                 input_height, input_width = mask_data.shape[1], mask_data.shape[2]
@@ -445,15 +444,27 @@ class InferenceThread(threading.Thread):
         except Exception as e:
             print(f"💥 Inference Thread 치명적 오류: {e}")
         finally:
+            # 🚀 GPU 메모리 완전 정리
+            self.model_vp.predictor = None
+            if hasattr(self, 'prev_vpe') and self.prev_vpe is not None:
+                del self.prev_vpe
+                self.prev_vpe = None
+            
+            import torch
+            torch.cuda.empty_cache()
+            
             # 종료 신호를 Result Queue에 반드시 전달 (Queue가 빌 때까지 대기)
             print("📤 Inference Thread 종료 신호 전송 준비 중...")
+            queue_full_warning_shown = False
             while True:
                 try:
                     self.result_queue.put(None, timeout=1.0)
                     print("🏁 Inference Thread 종료 신호 Result Queue에 전달 완료!")
                     break
                 except queue.Full:
-                    print("⏳ Result Queue 가득함, 종료 신호 전송을 위해 대기 중...")
+                    if not queue_full_warning_shown:
+                        print("⏳ Result Queue 가득함, 종료 신호 전송을 위해 대기 중...")
+                        queue_full_warning_shown = True
                     time.sleep(0.1)
             
             print(f"📈 Inference Thread 최종 통계:")
@@ -461,9 +472,10 @@ class InferenceThread(threading.Thread):
             print(f"   - 처리된 프레임 수: {self.stats['total_frames_processed']}")
             print(f"   - VPE 업데이트 횟수: {self.stats['vpe_updates']}")
             print(f"   - 실패한 배치 수: {self.stats['failed_batches']}")
+            print("🚀 GPU 메모리 완전 정리 완료!")
     
     def _inference_batch(self, batch_frames):
-        """배치 추론 실행"""
+        """배치 추론 실행 및 GPU → CPU 변환"""
         try:
             batch_size = len(batch_frames)
             
@@ -489,10 +501,62 @@ class InferenceThread(threading.Thread):
                     verbose=False
                 )
             
-            return results
+            # 🔥 GPU → CPU 변환을 여기서 수행하여 메모리 효율성 확보!
+            cpu_results = []
+            for result in results:
+                cpu_result = {
+                    'boxes_xyxy': result.boxes.xyxy.cpu().numpy() if len(result.boxes) > 0 else np.empty((0, 4)),
+                    'boxes_conf': result.boxes.conf.cpu().numpy() if len(result.boxes) > 0 else np.empty(0),
+                    'boxes_cls': result.boxes.cls.cpu().numpy().astype(int) if len(result.boxes) > 0 else np.empty(0, dtype=int),
+                    'orig_img': result.orig_img,
+                    'orig_shape': result.orig_shape,
+                    'has_boxes': len(result.boxes) > 0
+                }
+                
+                # 마스크 정보 처리 (있을 경우)
+                if hasattr(result, 'masks') and result.masks is not None:
+                    try:
+                        # masks.xy 사용 (이미 원본 좌표계로 변환됨)
+                        if hasattr(result.masks, 'xy') and result.masks.xy is not None:
+                            masks_xy_list = []
+                            for mask_coords in result.masks.xy:
+                                # GPU tensor인지 numpy array인지 확인 후 변환
+                                if hasattr(mask_coords, 'cpu'):
+                                    masks_xy_list.append(mask_coords.cpu().numpy())
+                                else:
+                                    masks_xy_list.append(mask_coords)  # 이미 numpy array
+                            cpu_result['masks_xy'] = masks_xy_list
+                            cpu_result['masks_type'] = 'xy'
+                        # xy가 없으면 data 사용
+                        elif hasattr(result.masks, 'data'):
+                            # GPU tensor인지 numpy array인지 확인 후 변환
+                            if hasattr(result.masks.data, 'cpu'):
+                                cpu_result['masks_data'] = result.masks.data.cpu().numpy()
+                            else:
+                                cpu_result['masks_data'] = result.masks.data  # 이미 numpy array
+                            cpu_result['masks_type'] = 'data'
+                        else:
+                            cpu_result['masks_type'] = None
+                    except Exception as e:
+                        print(f"⚠️ 마스크 CPU 변환 오류: {e}")
+                        cpu_result['masks_type'] = None
+                else:
+                    cpu_result['masks_type'] = None
+                
+                cpu_results.append(cpu_result)
+            
+            # 🚀 GPU 메모리 즉시 정리
+            del results
+            import torch
+            torch.cuda.empty_cache()
+            
+            return cpu_results
             
         except Exception as e:
             print(f"💥 배치 추론 오류: {e}")
+            # GPU 메모리 정리
+            import torch
+            torch.cuda.empty_cache()
             return None
     
     def _update_vpe(self, batch_results):
@@ -519,15 +583,15 @@ class InferenceThread(threading.Thread):
             return False
     
     def _update_batch_vpe(self, batch_results):
-        """배치 결과에서 VPE 생성 (기존 함수 로직 활용)"""
+        """배치 결과에서 VPE 생성 (CPU 데이터 기반)"""
         high_conf_prompts = []
         
         # Batch 내 모든 프레임에서 high-confidence detection 수집
-        for i, result in enumerate(batch_results):
-            if len(result.boxes) > 0:
-                confidences = result.boxes.conf.cpu().numpy()
-                boxes = result.boxes.xyxy.cpu().numpy()
-                class_ids = result.boxes.cls.cpu().numpy()
+        for i, cpu_result in enumerate(batch_results):
+            if cpu_result['has_boxes']:
+                confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
+                boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
+                class_ids = cpu_result['boxes_cls']  # 이미 CPU numpy array
                 
                 high_conf_mask = confidences >= self.args.vp_thresh
                 
@@ -536,7 +600,7 @@ class InferenceThread(threading.Thread):
                     prompt_data = {
                         "bboxes": boxes[high_conf_mask],
                         "cls": class_ids[high_conf_mask],
-                        "frame": result.orig_img,
+                        "frame": cpu_result['orig_img'],  # 원본 이미지 정보
                         "frame_idx": i
                     }
                     
@@ -595,17 +659,24 @@ class InferenceThread(threading.Thread):
                 else:
                     averaged_vpe = batch_vpe
                 
-                # 예측기 정리
+                # 🚀 예측기 정리 및 GPU 메모리 해제
                 self.model_vp.predictor = None
+                del batch_vpe
+                import torch
+                torch.cuda.empty_cache()
                 
                 return averaged_vpe
             else:
                 self.model_vp.predictor = None
+                import torch
+                torch.cuda.empty_cache()
                 return None
                 
         except Exception as e:
             print(f"💥 배치 VPE 생성 중 오류: {e}")
             self.model_vp.predictor = None
+            import torch
+            torch.cuda.empty_cache()
             return None
 
 
@@ -854,7 +925,7 @@ class FrameLoadingThread(threading.Thread):
             'total_count': batch_size
         }
     
-    # ANCHOR Main Thread Run
+    # ANCHOR Frame Loading Thread Run
     def run(self):
         """메인 배치 로딩 루프 (Consumer)"""
         print("\n🚀 Frame Loading Thread 시작!")
@@ -900,13 +971,16 @@ class FrameLoadingThread(threading.Thread):
         finally:
             # 종료 신호를 Queue에 반드시 전달 (Queue가 빌 때까지 대기)
             print("📤 종료 신호 전송 준비 중...")
+            queue_full_warning_shown = False
             while True:
                 try:
                     self.batch_queue.put(None, timeout=1.0)  # None은 종료 신호
                     print("🏁 Frame Loading Thread 종료 신호 전달 완료!")
                     break
                 except queue.Full:
-                    print("⏳ Queue 가득참, 종료 신호 전송을 위해 대기 중...")
+                    if not queue_full_warning_shown:
+                        print("⏳ Queue 가득참, 종료 신호 전송을 위해 대기 중...")
+                        queue_full_warning_shown = True
                     time.sleep(0.1)
             
             # 내부 스레드 정리
@@ -987,9 +1061,9 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                          # 라인 크로싱 관련
                          p1, p2, seg_dx, seg_dy, seg_len2,
                          width, height,
-                         # Progress bar
-                         pbar=None):
-    """Batch 결과를 개별 프레임으로 처리"""
+                         # Progress bar & Queue monitoring
+                         pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None):
+    """Batch 결과를 개별 프레임으로 처리 (CPU 데이터 기반)"""
     
     updated_state = {
         'forward_cnt': forward_cnt,
@@ -1000,7 +1074,7 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         'last_save_frame': last_save_frame
     }
     
-    for result, frame_idx, original_frame in zip(batch_results, batch_indices, batch_original_frames):
+    for cpu_result, frame_idx, original_frame in zip(batch_results, batch_indices, batch_original_frames):
         # 시간 계산
         current_time = frame_idx / fps
         hours = int(current_time // 3600)
@@ -1009,11 +1083,11 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         milliseconds = int((current_time % 1) * 1000)
         time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
         
-        # ObjectMeta 변환
-        detected_objects = convert_results_to_objects(result, args.names)
+        # ObjectMeta 변환 (CPU 데이터 기반)
+        detected_objects = convert_results_to_objects(cpu_result, args.names)
         
         # Tracker 업데이트 (기존 로직 유지)
-        tracked_objects = tracker.update(detected_objects, result.orig_img, "None")
+        tracked_objects = tracker.update(detected_objects, cpu_result['orig_img'], "None")
         
         # 기존 변수들 추출 (호환성 유지)
         if tracked_objects:
@@ -1037,10 +1111,6 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             class_counts = defaultdict(int)
             for cid in class_ids:
                 class_counts[cid] += 1
-
-            # print(f"Frame {frame_idx} - Class counts:")
-            # for cid, count in class_counts.items():
-            #     print(f"  {args.names[cid]}: {count}")
 
             for cid, tid in zip(class_ids, track_ids):
                 class_name = args.names[cid]
@@ -1175,19 +1245,29 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         # 비디오 출력
         out.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
         
-        # Progress bar 즉시 업데이트 (프레임 단위)
+        # Progress bar 즉시 업데이트 (프레임 단위) + 실시간 메트릭 반영
         if pbar is not None:
             pbar.update(1)
             
-            # # 주기적으로 postfix 업데이트 (매 10 프레임마다)
-            # if frame_idx % 10 == 0:
-            #     pbar.set_postfix({
-            #         'occupancy': updated_state['current_occupancy'],
-            #         'congestion': f"{updated_state['current_congestion']}%",
-            #         'forward': updated_state['forward_cnt'],
-            #         'backward': updated_state['backward_cnt'],
-            #         'frame': frame_idx
-            #     })
+            # 실시간 메트릭을 postfix로 표시
+            if frame_queue is not None and result_queue is not None and pipeline_stats is not None:
+                frame_queue_size = frame_queue.qsize()
+                result_queue_size = result_queue.qsize()
+                
+                # FPS 계산
+                elapsed_time = time.time() - pipeline_stats['start_time']
+                avg_fps = pipeline_stats['processed_frames'] / elapsed_time if elapsed_time > 0 else 0
+                
+                # 실시간 메트릭을 postfix로 업데이트
+                pbar.set_postfix({
+                    'FPS': f'{avg_fps:.1f}',
+                    'Frame_Q': frame_queue_size,
+                    'Result_Q': result_queue_size
+                    # 'Occupancy': updated_state['current_occupancy'],
+                    # 'Congestion': f"{updated_state['current_congestion']}%",
+                    # 'Forward': updated_state['forward_cnt'],
+                    # 'Backward': updated_state['backward_cnt']
+                })
     
     return updated_state
 
@@ -1365,7 +1445,7 @@ def main() -> None:
 
     print(f"\n🎬 Process Results 시작\n")
     
-    pbar = tqdm(total=total_frames, desc="🔥 3-Stage Pipeline Processing")
+    pbar = tqdm(total=total_frames, desc="🔥 Pipeline Processing")
 
     # ────────────────── 🚀 MAIN THREAD RESULT PROCESSING LOOP 🚀 ───────────────── #
     try:
@@ -1409,8 +1489,8 @@ def main() -> None:
                     # 라인 크로싱 관련
                     p1, p2, seg_dx, seg_dy, seg_len2,
                     width, height,
-                    # Progress bar
-                    pbar
+                    # Progress bar & Queue monitoring
+                    pbar, frame_queue, result_queue, pipeline_stats
                 )
                 
                 # 상태 변수 업데이트
@@ -1429,12 +1509,7 @@ def main() -> None:
                 elapsed_time = time.time() - pipeline_stats['start_time']
                 avg_fps = pipeline_stats['processed_frames'] / elapsed_time if elapsed_time > 0 else 0
                 
-                # 배치 완료 후 전체 통계 업데이트 (덜 빈번하게)
-                frame_queue_size = frame_queue.qsize()
-                result_queue_size = result_queue.qsize()
-                
-                # 프레임별 postfix는 process_batch_results에서 처리되므로 여기서는 전체 통계만
-                pbar.set_description(f"🔥 Pipeline [FPS:{avg_fps:.1f}] [VPE:{'ON' if prev_vpe_status else 'OFF'}] [Q:{frame_queue_size}/{result_queue_size}]")
+                # 배치 완료 후에는 별도 업데이트 불필요 (process_batch_results에서 프레임별로 실시간 업데이트됨)
                 
                 # print(f"✅ Main Thread: Batch {batch_idx + 1} 완료 ({loaded_count} 프레임, VPE: {'Updated' if vpe_updated else 'Kept'})")
                 batch_idx += 1
