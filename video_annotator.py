@@ -63,7 +63,7 @@ class ObjectMeta:
 # ANCHOR argparse
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    # I/O
+    # NOTE [args] source & output
     # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
     parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--names", nargs="+",
                         default=["fish", "disco ball", "pig"],
                         help="Custom class names list (index order matters)")
+    # NOTE [args] GPU Device
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
     # Inference / tracking
@@ -137,7 +138,7 @@ def parse_args() -> argparse.Namespace:
                         help="ROI zone names separated by comma")
     parser.add_argument("--roi-detection-method", choices=['bbox', 'mask', 'hybrid'], 
                         default='bbox', help="ROI detection method: bbox overlap, mask overlap, or hybrid")
-    parser.add_argument("--roi-dwell-time", type=float, default=0.5,
+    parser.add_argument("--roi-dwell-time", type=float, default=1.0,
                         help="Minimum dwell time in seconds for ROI access detection")
     parser.add_argument("--roi-bbox-threshold", type=float, default=0.1,
                         help="Minimum bbox overlap ratio for ROI detection")
@@ -389,7 +390,7 @@ class ROIAccessManager:
                             # 중복 카운트 방지
                             roi_stat['current_tracks'][obj.track_id]['counted'] = True
                             
-                            print(f"🎯 ROI 접근 감지: {roi_name} - track_id:{obj.track_id} ({obj.class_name})")
+                            # print(f"🎯 ROI 접근 감지: {roi_name} - track_id:{obj.track_id} ({obj.class_name})")
                     
                     else:
                         # 새로 ROI에 진입한 객체
@@ -518,15 +519,23 @@ class ROIAccessManager:
 
 
 # ─────────────────────── ROI Visualization Functions ────────────────────────────── #
+# NOTE Draw ROI polygons
 def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
-    """ROI polygon들을 이미지에 그리기"""
-    for polygon, roi_name in zip(roi_polygons, roi_names):
+    """ROI polygon들을 이미지에 그리기 (반투명 색칠 포함)"""
+    
+    # 반투명 내부 채우기를 위한 복사본 생성
+    overlay = image.copy()
+    
+    for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
         try:
             # polygon 좌표 추출
             coords = np.array(polygon.exterior.coords, dtype=np.int32)
             
-            # 빨간색 테두리로 polygon 그리기
-            cv2.polylines(image, [coords], isClosed=True, color=(255, 0, 0), thickness=6)
+            # 색상 선택
+            color = (255, 228, 0)
+            
+            # 1. polygon 내부를 색으로 채우기 (overlay에만 - 나중에 투명도 적용)
+            cv2.fillPoly(overlay, [coords], color)
             
             # ROI 이름과 접근 횟수 표시
             if roi_name in roi_stats:
@@ -543,15 +552,28 @@ def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
                 thickness = 2
                 (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
                 
-                # 배경 사각형
+                # 배경 사각형 (원본 image에 직접)
                 cv2.rectangle(image, (text_x - 5, text_y - text_h - 10), 
-                             (text_x + text_w + 5, text_y + 5), (255, 0, 0), -1)
+                             (text_x + text_w + 5, text_y + 5), color, -1)
                 
-                # 텍스트
+                # 텍스트 (원본 image에 직접)
                 cv2.putText(image, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
         
         except Exception as e:
             print(f"⚠️ ROI polygon 그리기 오류: {e}")
+    
+    # 2. 반투명 내부 채우기 블렌딩 (투명도 30%)
+    alpha = 0.4
+    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    
+    # 3. 테두리 그리기 (투명도 없이 원본 image에 직접)
+    for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
+        try:
+            coords = np.array(polygon.exterior.coords, dtype=np.int32)
+            color = (255, 0, 0)
+            cv2.polylines(image, [coords], isClosed=True, color=color, thickness=8)
+        except Exception as e:
+            print(f"⚠️ ROI polygon 테두리 그리기 오류: {e}")
     
     return image
 
@@ -1575,6 +1597,21 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         
         annotated = frame_rgb.copy()
         
+        # ROI 시각화 (출력 해상도에 맞게 스케일링)
+        if roi_manager is not None:
+            # ROI polygon을 출력 해상도에 맞게 스케일링
+            scaled_roi_polygons = []
+            for polygon in roi_manager.roi_polygons:
+                coords = np.array(polygon.exterior.coords)
+                scaled_coords = coords * [scale_x, scale_y]
+                from shapely.geometry import Polygon
+                scaled_polygon = Polygon(scaled_coords)
+                scaled_roi_polygons.append(scaled_polygon)
+            
+            # ROI polygon 그리기 (스케일링된 좌표로)
+            annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
+                                        roi_manager.roi_names, roi_manager.roi_stats)        
+        
         # 객체 오버레이 (스케일링된 좌표로)
         scaled_objects = []
         if tracked_objects:
@@ -1600,22 +1637,8 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             
             annotated = draw_objects_overlay(annotated, scaled_objects, palette)
         
-        # ROI 시각화 (출력 해상도에 맞게 스케일링)
+        # ROI에 있는 객체들 하이라이트 (스케일링된 객체로)
         if roi_manager is not None:
-            # ROI polygon을 출력 해상도에 맞게 스케일링
-            scaled_roi_polygons = []
-            for polygon in roi_manager.roi_polygons:
-                coords = np.array(polygon.exterior.coords)
-                scaled_coords = coords * [scale_x, scale_y]
-                from shapely.geometry import Polygon
-                scaled_polygon = Polygon(scaled_coords)
-                scaled_roi_polygons.append(scaled_polygon)
-            
-            # ROI polygon 그리기 (스케일링된 좌표로)
-            annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
-                                        roi_manager.roi_names, roi_manager.roi_stats)
-            
-            # ROI에 있는 객체들 하이라이트 (스케일링된 객체로)
             if tracked_objects:
                 annotated = highlight_roi_objects(annotated, scaled_objects, 
                                                 current_roi_tracks, palette)
