@@ -34,6 +34,9 @@ import torch
 from tracker.boostTrack.GBI import GBInterpolation
 from tracker.boostTrack.boost_track import BoostTrack
 
+# ────────────────────────────── Global Debug Counter ──────────────────────────────────── #
+_debug_frame_count = 0
+_max_debug_frames = 5  # 처음 5프레임만 디버깅 출력
 
 # ────────────────────────────── ObjectMeta Class ──────────────────────────── #
 class ObjectMeta:
@@ -46,9 +49,10 @@ class ObjectMeta:
         self.box = box              # [x1, y1, x2, y2] or [cx, cy, w, h]
         self.mask = mask            # segmentation mask array
         self.confidence = confidence # detection confidence score
-        self.class_id = class_id    # class index
+        self.class_id = class_id    # class index (confidence에 따라 조정된 클래스)
         self.class_name = class_name # class name string
         self.track_id = track_id    # tracking ID (None initially)
+        self.original_class_id = class_id  # 원본 클래스 ID (VPE 업데이트용)
     
     def __repr__(self):
         return f"ObjectMeta(class={self.class_name}, track_id={self.track_id}, conf={self.confidence:.2f})"
@@ -72,7 +76,8 @@ def parse_args() -> argparse.Namespace:
                         default="pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
-                        default=["pig", "disco ball", "object"],
+                        default=["fish", "disco ball", "object"],
+                        # default=["pig", "disco ball", "object"],
                         help="Custom class names list (index order matters)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
@@ -81,7 +86,7 @@ def parse_args() -> argparse.Namespace:
                         help="Inference image size")
     parser.add_argument("--conf-thresh", type=float, default=0.001,
                         help="Detection confidence threshold")
-    parser.add_argument("--vp-thresh", type=float, default=0.3,
+    parser.add_argument("--vp-thresh", type=float, default=0.1,
                         help="visual prompt confidence threshold")
     parser.add_argument("--iou-thresh", type=float, default=0.45,
                         help="Detection NMS IoU threshold")
@@ -103,16 +108,16 @@ def parse_args() -> argparse.Namespace:
     # Snapshot
     parser.add_argument("--cross-vp", type=bool, default=True,
                         help="Enable cross visual prompt mode")
-    parser.add_argument("--save-interval", type=int, default=150,
+    parser.add_argument("--save-interval", type=int, default=1,
                         help="Interval for saving intermediate frames")
     # Batch processing
-    parser.add_argument("--batch-size", type=int, default=64,
+    parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
-    parser.add_argument("--vpe-momentum", type=float, default=0.1,
+    parser.add_argument("--vpe-momentum", type=float, default=0.9,
                         help="VPE moving average momentum")
-    parser.add_argument("--limit-frame", type=int, default=300,
+    parser.add_argument("--limit-frame", type=int, default=5,
                         help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -350,7 +355,13 @@ def point_side(p, a, b) -> int:
 def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
     """
     CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환
+    Confidence 기준에 따른 클래스 할당:
+    - conf >= 0.1: 정상적인 클래스 부여
+    - 0.01 <= conf < 0.1: 'object' 클래스로 부여
+    - conf < 0.01: 필터링 (사용하지 않음)
     """
+    global _debug_frame_count, _max_debug_frames
+    
     objects = []
     
     if not cpu_result['has_boxes']:
@@ -359,6 +370,37 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
     boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
     confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
     class_ids = cpu_result['boxes_cls']  # 이미 CPU numpy array
+    
+    # 🔍 Confidence 분포 디버깅 (처음 몇 프레임만)
+    should_debug = _debug_frame_count < _max_debug_frames
+    
+    if should_debug and len(confidences) > 0:
+        high_conf_count = np.sum(confidences >= 0.3)
+        medium_conf_count = np.sum((confidences >= 0.1) & (confidences < 0.3))
+        low_conf_count = np.sum((confidences >= 0.01) & (confidences < 0.1))
+        very_low_conf_count = np.sum(confidences < 0.01)
+        
+        print(f"📊 프레임 {_debug_frame_count + 1} - Confidence 분포 (총 {len(confidences)}개):")
+        print(f"   - conf >= 0.3     : {high_conf_count}개 (VPE 업데이트용)")
+        print(f"   - 0.1 <= conf < 0.3: {medium_conf_count}개 (정상 클래스)")
+        print(f"   - 0.01 <= conf < 0.1: {low_conf_count}개 (→ 'object' 클래스)")
+        print(f"   - conf < 0.01     : {very_low_conf_count}개 (필터링됨)")
+        
+        if len(confidences) > 0:
+            print(f"   - 최고 confidence: {np.max(confidences):.3f}")
+            print(f"   - 최저 confidence: {np.min(confidences):.3f}")
+            print(f"   - 평균 confidence: {np.mean(confidences):.3f}")
+    
+    # confidence 0.01 미만 필터링
+    valid_mask = confidences >= 0.01
+    boxes = boxes[valid_mask]
+    confidences = confidences[valid_mask]
+    class_ids = class_ids[valid_mask]
+    
+    if len(boxes) == 0:
+        if should_debug:
+            print("⚠️ 0.01 이상의 confidence를 가진 객체가 없습니다!")
+        return objects
     
     # 마스크 정보 처리 (정교한 변환 로직 사용)
     masks = None
@@ -418,16 +460,59 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
             print(f"⚠️ 마스크 변환 오류: {e}")
             masks = None
     
+    # 'object' 클래스의 인덱스 찾기 (마지막 클래스로 가정)
+    object_class_id = len(class_names) - 1
+    object_class_name = class_names[object_class_id] if object_class_id < len(class_names) else "object"
+    
+    # 🔍 클래스 할당 디버깅용 카운터
+    high_conf_assigned = 0
+    medium_conf_assigned = 0
+    low_conf_assigned = 0
+    
     for i in range(len(boxes)):
+        conf = confidences[i]
+        original_class_id = class_ids[i]
+        
+        # Confidence에 따른 클래스 할당
+        if conf >= 0.1:
+            # 정상적인 클래스 부여
+            final_class_id = original_class_id
+            final_class_name = class_names[original_class_id] if original_class_id < len(class_names) else "unknown"
+            if conf >= 0.3:
+                high_conf_assigned += 1
+            else:
+                medium_conf_assigned += 1
+        else:  # 0.01 <= conf < 0.1
+            # 'object' 클래스로 부여
+            final_class_id = object_class_id
+            final_class_name = object_class_name
+            low_conf_assigned += 1
+            if should_debug:
+                print(f"🎯 저신뢰도 객체 발견! conf={conf:.3f}, 원본클래스={class_names[original_class_id] if original_class_id < len(class_names) else 'unknown'} → 'object' 클래스로 할당")
+        
         obj = ObjectMeta(
             box=boxes[i],
             mask=masks[i] if masks is not None else None,
-            confidence=confidences[i],
-            class_id=class_ids[i],
-            class_name=class_names[class_ids[i]],
+            confidence=conf,
+            class_id=final_class_id,
+            class_name=final_class_name,
             track_id=None  # 트래커에서 부여받을 예정
         )
+        # 원본 클래스 정보도 저장 (VPE 업데이트용)
+        obj.original_class_id = original_class_id
         objects.append(obj)
+    
+    # 최종 할당 결과 출력 (디버깅 프레임에서만)
+    if should_debug and len(objects) > 0:
+        print(f"✅ 클래스 할당 완료:")
+        print(f"   - 고신뢰도 (≥0.3): {high_conf_assigned}개")
+        print(f"   - 중신뢰도 (0.1~0.3): {medium_conf_assigned}개") 
+        print(f"   - 저신뢰도 (0.01~0.1 → 'object'): {low_conf_assigned}개")
+        print(f"   - 총 할당된 객체: {len(objects)}개")
+        print("-" * 50)
+    
+    # 디버그 카운터 증가
+    _debug_frame_count += 1
     
     return objects
 
@@ -436,7 +521,9 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
 def draw_box(image, box, track_id, class_id, color_palette):
     """박스 그리기"""
     x1, y1, x2, y2 = map(int, box)
-    color = color_palette.by_idx(track_id).as_bgr()
+    # 음수 track_id를 양수로 변환
+    safe_track_id = abs(track_id) if track_id < 0 else track_id
+    color = color_palette.by_idx(safe_track_id).as_bgr()
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
     return image
 
@@ -445,7 +532,9 @@ def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
     if mask is None:
         return image
     
-    color = color_palette.by_idx(track_id).as_bgr()
+    # 음수 track_id를 양수로 변환
+    safe_track_id = abs(track_id) if track_id < 0 else track_id
+    color = color_palette.by_idx(safe_track_id).as_bgr()
     
     # 마스크 크기 검증 및 상세 디버깅
     if mask.shape[:2] != image.shape[:2]:
@@ -483,7 +572,9 @@ def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
 def draw_label(image, box, track_id, class_name, confidence, color_palette):
     """라벨 그리기"""
     x1, y1, x2, y2 = map(int, box)
-    color = color_palette.by_idx(track_id).as_bgr()
+    # 음수 track_id를 양수로 변환
+    safe_track_id = abs(track_id) if track_id < 0 else track_id
+    color = color_palette.by_idx(safe_track_id).as_bgr()
     
     # 라벨 텍스트
     label = f"{class_name} {track_id} {confidence:.2f}"
@@ -504,17 +595,122 @@ def draw_label(image, box, track_id, class_name, confidence, color_palette):
     
     return image
 
-def draw_objects_overlay(image, objects, color_palette):
-    """모든 개체의 overlay 그리기 (Supervision 방식: 큰 객체부터 작은 객체 순)"""
-    # area 계산하여 큰 것부터 정렬 (Supervision과 동일)
-    valid_objects = [obj for obj in objects if obj.track_id is not None]
+def draw_low_conf_box(image, box, track_id, class_id, color_palette):
+    """저신뢰도 박스 그리기 (점선 스타일)"""
+    x1, y1, x2, y2 = map(int, box)
+    # 음수 track_id를 양수로 변환
+    safe_track_id = abs(track_id) if track_id < 0 else track_id
+    color = color_palette.by_idx(safe_track_id).as_bgr()
     
-    if not valid_objects:
+    # 점선 효과를 위한 파라미터
+    dash_length = 10
+    gap_length = 5
+    thickness = 2
+    
+    # 상단 선 (점선)
+    x = x1
+    while x < x2:
+        end_x = min(x + dash_length, x2)
+        cv2.line(image, (x, y1), (end_x, y1), color, thickness)
+        x += dash_length + gap_length
+    
+    # 하단 선 (점선)
+    x = x1
+    while x < x2:
+        end_x = min(x + dash_length, x2)
+        cv2.line(image, (x, y2), (end_x, y2), color, thickness)
+        x += dash_length + gap_length
+    
+    # 좌측 선 (점선)
+    y = y1
+    while y < y2:
+        end_y = min(y + dash_length, y2)
+        cv2.line(image, (x1, y), (x1, end_y), color, thickness)
+        y += dash_length + gap_length
+    
+    # 우측 선 (점선)
+    y = y1
+    while y < y2:
+        end_y = min(y + dash_length, y2)
+        cv2.line(image, (x2, y), (x2, end_y), color, thickness)
+        y += dash_length + gap_length
+    
+    return image
+
+def draw_low_conf_label(image, box, track_id, class_name, confidence, color_palette):
+    """저신뢰도 라벨 그리기 (반투명 배경과 특별한 형식)"""
+    x1, y1, x2, y2 = map(int, box)
+    # 음수 track_id를 양수로 변환
+    safe_track_id = abs(track_id) if track_id < 0 else track_id
+    color = color_palette.by_idx(safe_track_id).as_bgr()
+    
+    # 라벨 텍스트 (저신뢰도 표시 추가)
+    label = f"[LOW] {class_name} {confidence:.3f}"
+    
+    
+    # 텍스트 크기 계산
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+    
+    # 반투명 배경을 위한 오버레이
+    overlay = image.copy()
+    
+    # 라벨 배경 그리기 (더 어두운 색상으로)
+    bg_color = tuple(int(c * 0.6) for c in color)  # 원래 색상의 60%로 어둡게
+    cv2.rectangle(overlay, (x1, y1 - text_h - baseline - 10), 
+                  (x1 + text_w + 10, y1), bg_color, -1)
+    
+    # 반투명 효과 적용
+    alpha = 0.7
+    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    
+    # 텍스트 그리기 (밝은 색으로)
+    cv2.putText(image, label, (x1 + 5, y1 - baseline - 5), 
+                font, font_scale, (255, 255, 255), thickness)
+    
+    return image
+
+def draw_objects_overlay(image, objects, color_palette):
+    """모든 개체의 overlay 그리기 (Supervision 방식: 큰 객체부터 작은 객체 순)
+    추적된 모든 객체 표시 (정상 신뢰도 + 저신뢰도 객체 모두)
+    """
+    if not objects:
         return image
     
-    # 박스 area 계산
+    # 객체 타입별 분리 (저신뢰도 'object' 클래스 구분)
+    normal_objects = []
+    low_conf_objects = []
+    
+    for obj in objects:
+        if (hasattr(obj, 'class_name') and obj.class_name == 'object' and 
+            0.01 <= obj.confidence < 0.1):
+            low_conf_objects.append(obj)
+        else:
+            normal_objects.append(obj)
+    
+    # 🔍 실시간 디버깅 (간단한 출력)
+    global _debug_frame_count, _max_debug_frames
+    if _debug_frame_count <= _max_debug_frames and objects:
+        print(f"🎨 실제 오버레이 표시:")
+        print(f"   - 정상 객체: {len(normal_objects)}개")
+        print(f"   - 저신뢰도 object: {len(low_conf_objects)}개")
+        
+        if low_conf_objects:
+            conf_values = [f"{obj.confidence:.3f}" for obj in low_conf_objects]
+            track_ids = [f"{obj.track_id}" for obj in low_conf_objects]
+            print(f"   - 저신뢰도 confidence: {', '.join(conf_values)}")
+            print(f"   - 저신뢰도 track_ids: {', '.join(track_ids)}")
+    
+    all_display_objects = normal_objects + low_conf_objects
+    
+    if not all_display_objects:
+        return image
+    
+    # 박스 area 계산하여 큰 것부터 정렬 (Supervision과 동일)
     areas = []
-    for obj in valid_objects:
+    for obj in all_display_objects:
         x1, y1, x2, y2 = obj.box
         area = (x2 - x1) * (y2 - y1)
         areas.append(area)
@@ -524,18 +720,26 @@ def draw_objects_overlay(image, objects, color_palette):
     
     # 마스크부터 먼저 그리기 (supervision 방식)
     for idx in sorted_indices:
-        obj = valid_objects[idx]
-        # 마스크 그리기
-        image = draw_mask(image, obj.mask, obj.track_id, obj.class_id, color_palette)
+        obj = all_display_objects[idx]
+        display_track_id = obj.track_id if obj.track_id is not None else -999 - idx
+        image = draw_mask(image, obj.mask, display_track_id, obj.class_id, color_palette)
     
     # 그 다음 박스와 라벨 그리기 (원래 순서대로)
-    for obj in valid_objects:
-        # 박스 그리기
-        image = draw_box(image, obj.box, obj.track_id, obj.class_id, color_palette)
+    for obj in all_display_objects:
+        display_track_id = obj.track_id if obj.track_id is not None else -999
         
-        # 라벨 그리기
-        image = draw_label(image, obj.box, obj.track_id, obj.class_name, 
-                          obj.confidence, color_palette)
+        # 저신뢰도 'object' 클래스는 특별 스타일로 그리기
+        if (hasattr(obj, 'class_name') and obj.class_name == 'object' and 
+            0.01 <= obj.confidence < 0.1):
+            # 저신뢰도 객체: 점선 박스와 특별 라벨
+            image = draw_low_conf_box(image, obj.box, display_track_id, obj.class_id, color_palette)
+            image = draw_low_conf_label(image, obj.box, display_track_id, obj.class_name, 
+                                      obj.confidence, color_palette)
+        else:
+            # 정상 객체: 일반 스타일
+            image = draw_box(image, obj.box, display_track_id, obj.class_id, color_palette)
+            image = draw_label(image, obj.box, display_track_id, obj.class_name, 
+                              obj.confidence, color_palette)
     
     return image
 
@@ -566,6 +770,11 @@ class InferenceThread(threading.Thread):
         print(f"   - GPU 디바이스: {args.device}")
         print(f"   - Cross-VP 모드: {'활성화' if args.cross_vp else '비활성화'}")
         print(f"   - VPE 모멘텀: {args.vpe_momentum}")
+        print(f"\n📊 Confidence 기준:")
+        print(f"   - conf >= 0.3  : VPE 업데이트 + 정상 클래스")
+        print(f"   - conf >= 0.1  : 정상 클래스 부여")
+        print(f"   - 0.01~0.1     : 'object' 클래스 + VPE 추가")
+        print(f"   - conf < 0.01  : 필터링 (사용하지 않음)")
     
     def stop(self):
         """스레드 종료 요청"""
@@ -695,7 +904,7 @@ class InferenceThread(threading.Thread):
                 results = self.model_vp.predict(
                     source=batch_frames,
                     imgsz=self.args.image_size,
-                    conf=self.args.conf_thresh,
+                    conf=0.01,  # 0.01 이상의 모든 객체 포함
                     iou=self.args.iou_thresh,
                     verbose=False
                 )
@@ -704,7 +913,7 @@ class InferenceThread(threading.Thread):
                 results = self.model_vp.predict(
                     source=batch_frames,
                     imgsz=self.args.image_size,
-                    conf=0.05,
+                    conf=0.01,  # 0.01 이상의 모든 객체 포함
                     iou=self.args.iou_thresh,
                     verbose=False
                 )
@@ -791,38 +1000,61 @@ class InferenceThread(threading.Thread):
             return False
     
     def _update_batch_vpe(self, batch_results):
-        """배치 결과에서 VPE 생성 (CPU 데이터 기반)"""
+        """배치 결과에서 VPE 생성 (CPU 데이터 기반)
+        confidence >= 0.3인 detection만 VPE 업데이트에 사용
+        0.01 <= confidence < 0.1인 'object' 클래스도 embedding에 추가
+        """
         high_conf_prompts = []
+        low_conf_object_prompts = []  # 0.01~0.1 confidence의 object 클래스용
         
-        # Batch 내 모든 프레임에서 high-confidence detection 수집
+        # Batch 내 모든 프레임에서 confidence별 detection 수집
         for i, cpu_result in enumerate(batch_results):
             if cpu_result['has_boxes']:
                 confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
                 boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
                 class_ids = cpu_result['boxes_cls']  # 이미 CPU numpy array
                 
-                high_conf_mask = confidences >= self.args.vp_thresh
-                
+                # 1. High confidence (>= 0.3): VPE 업데이트용
+                high_conf_mask = confidences >= 0.3
                 if np.any(high_conf_mask):
-                    # High confidence detection을 프롬프트로 사용
                     prompt_data = {
                         "bboxes": boxes[high_conf_mask],
                         "cls": class_ids[high_conf_mask],
-                        "frame": cpu_result['orig_img'],  # 원본 이미지 정보
-                        "frame_idx": i
+                        "frame": cpu_result['orig_img'],
+                        "frame_idx": i,
+                        "type": "high_conf"
                     }
-                    
-                    # 모든 클래스가 포함되도록 추가
-                    for cls_idx in range(len(self.args.names)):
-                        if cls_idx not in class_ids:
-                            prompt_data["bboxes"] = np.append(prompt_data["bboxes"], [[0, 0, 0, 0]], axis=0)
-                            prompt_data["cls"] = np.append(prompt_data["cls"], [cls_idx])                
-                            
                     high_conf_prompts.append(prompt_data)
+                
+                # 2. Low confidence (0.01~0.1): object 클래스로 embedding에 추가
+                low_conf_mask = (confidences >= 0.01) & (confidences < 0.1)
+                if np.any(low_conf_mask):
+                    # 'object' 클래스 ID (마지막 클래스)
+                    object_class_id = len(self.args.names) - 1
+                    object_cls_array = np.full(np.sum(low_conf_mask), object_class_id, dtype=np.int32)
                     
-        if high_conf_prompts:
-            # Batch 내 프롬프트들로 VPE 생성
-            batch_vpe = self._generate_batch_vpe(high_conf_prompts)
+                    prompt_data = {
+                        "bboxes": boxes[low_conf_mask],
+                        "cls": object_cls_array,  # 모두 object 클래스
+                        "frame": cpu_result['orig_img'],
+                        "frame_idx": i,
+                        "type": "low_conf_object"
+                    }
+                    low_conf_object_prompts.append(prompt_data)
+                    
+        # 모든 프롬프트를 결합 (high confidence + low confidence object)
+        all_prompts = high_conf_prompts + low_conf_object_prompts
+        
+        if all_prompts:
+            # 결합된 프롬프트들로 VPE 생성
+            batch_vpe = self._generate_batch_vpe(all_prompts)
+            
+            # 통계 출력
+            high_count = len(high_conf_prompts)
+            low_count = len(low_conf_object_prompts)
+            if high_count > 0 or low_count > 0:
+                print(f"🎯 VPE 업데이트: 고신뢰도 {high_count}개, 저신뢰도(object) {low_count}개")
+            
             return batch_vpe
         else:
             return None
@@ -1294,8 +1526,40 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         # ObjectMeta 변환 (CPU 데이터 기반)
         detected_objects = convert_results_to_objects(cpu_result, args.names)
         
-        # Tracker 업데이트 (기존 로직 유지)
+        # 🔍 디버깅: 검출 객체 상황 확인 (처음 몇 프레임만)
+        global _debug_frame_count, _max_debug_frames
+        if _debug_frame_count <= _max_debug_frames:
+            print(f"🎯 프레임 {frame_idx} - 검출 객체:")
+            print(f"   - 전체 검출 객체: {len(detected_objects)}개")
+            
+            # confidence별 분포 확인
+            high_conf = [obj for obj in detected_objects if obj.confidence >= 0.3]
+            medium_conf = [obj for obj in detected_objects if 0.1 <= obj.confidence < 0.3]
+            low_conf = [obj for obj in detected_objects if 0.01 <= obj.confidence < 0.1]
+            
+            print(f"   - 고신뢰도 (≥0.3): {len(high_conf)}개")
+            print(f"   - 중신뢰도 (0.1~0.3): {len(medium_conf)}개")
+            print(f"   - 저신뢰도 (0.01~0.1): {len(low_conf)}개")
+            
+            if low_conf:
+                conf_list = [f"{obj.confidence:.3f}" for obj in low_conf]
+                print(f"   - 저신뢰도 confidence: {', '.join(conf_list)}")
+        
+        # 🔥 모든 객체를 tracker에 전달 (정상 객체 + 저신뢰도 객체 모두 포함)
         tracked_objects = tracker.update(detected_objects, cpu_result['orig_img'], "None")
+        
+        # 🎨 모든 추적된 객체들을 오버레이에 표시
+        all_objects_for_overlay = tracked_objects
+        
+        # 🔍 디버깅: 최종 오버레이 객체 확인
+        if _debug_frame_count <= _max_debug_frames:
+            print(f"   - 추적된 객체: {len(tracked_objects)}개")
+            print(f"   - 최종 오버레이 객체: {len(all_objects_for_overlay)}개")
+            
+            # track_id 부여 상황 확인
+            tracked_with_id = [obj for obj in tracked_objects if obj.track_id is not None]
+            print(f"   - track_id 부여된 객체: {len(tracked_with_id)}개")
+            print("-" * 40)
         
         # 기존 변수들 추출 (호환성 유지)
         if tracked_objects:
@@ -1333,8 +1597,10 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         # 시각화
         frame_rgb = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
         annotated = frame_rgb.copy()
-        if tracked_objects:
-            annotated = draw_objects_overlay(annotated, tracked_objects, palette)
+        
+        # 🎨 모든 객체들(추적된 객체 + 저신뢰도 객체)을 오버레이에 표시
+        if all_objects_for_overlay:
+            annotated = draw_objects_overlay(annotated, all_objects_for_overlay, palette)
 
         # Occupancy 업데이트
         raw_occupancy = int(np.sum(class_ids == person_class_id))
@@ -1401,30 +1667,30 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
             cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), 8, tipLength=0.6)
 
-        # Overlay 정보 그리기
-        overlay = [
-            f"[1] Congestion : {updated_state['current_congestion']:3d} %",
-            f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
-            f"[3] Occupancy  : {updated_state['current_occupancy']}",
-            f"[4] Time      : {time_str}"
-        ]
-        x0, y0, dy = 30, 60, 50
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1
-        font_thickness = 2
-        padding = 10
-        max_width = 0
-        for txt in overlay:
-            (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
-            max_width = max(max_width, tw)
-        rect_x1, rect_y1 = x0 - padding, y0 - th - padding
-        rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
-        overlay_rect = annotated.copy()
-        cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
-        annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
-        for i, txt in enumerate(overlay):
-            cv2.putText(annotated, txt, (x0, y0 + i * dy),
-                        font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+        # # Overlay 정보 그리기
+        # overlay = [
+        #     f"[1] Congestion : {updated_state['current_congestion']:3d} %",
+        #     f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
+        #     f"[3] Occupancy  : {updated_state['current_occupancy']}",
+        #     f"[4] Time      : {time_str}"
+        # ]
+        # x0, y0, dy = 30, 60, 50
+        # font = cv2.FONT_HERSHEY_SIMPLEX
+        # font_scale = 1
+        # font_thickness = 2
+        # padding = 10
+        # max_width = 0
+        # for txt in overlay:
+        #     (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
+        #     max_width = max(max_width, tw)
+        # rect_x1, rect_y1 = x0 - padding, y0 - th - padding
+        # rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
+        # overlay_rect = annotated.copy()
+        # cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
+        # annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
+        # for i, txt in enumerate(overlay):
+        #     cv2.putText(annotated, txt, (x0, y0 + i * dy),
+        #                 font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
 
         # 히트맵 minimap
         blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
