@@ -64,10 +64,10 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
-    parser.add_argument("--output", type=str, default=None,
+    parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
     # Logging
     parser.add_argument("--log-detections", type=bool, default=True,
@@ -148,9 +148,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-exit-grace-time", type=float, default=2.0,
                         help="Grace time in seconds before removing objects that left ROI")
     # Output resolution
-    parser.add_argument("--output-width", type=int, default=1920,
+    parser.add_argument("--output-width", type=int, default=1280,
                         help="Output video width (if not set, uses input width)")
-    parser.add_argument("--output-height", type=int, default=1080,
+    parser.add_argument("--output-height", type=int, default=720,
                         help="Output video height (if not set, uses input height)")
     return parser.parse_args()
 
@@ -1724,12 +1724,31 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             for roi_name, roi_stat in roi_manager.roi_stats.items():
                 overlay.append(f"[ROI] {roi_name}: {roi_stat['total_access']} accesses")
         
-        # 오버레이 텍스트 크기
-        x0, y0, dy = 30, 60, 50
+        # 오버레이 텍스트 크기 (0~1 정규화 좌표를 출력 해상도에 맞게 스케일링)
+        # 1920x1080 기준: x0=30, y0=60, dy=50, padding=10
+        # 정규화: x0=30/1920=0.0156, y0=60/1080=0.0556, dy=50/1080=0.0463, padding=10/1920=0.0052
+        
+        # 정규화된 좌표 (0~1 범위)
+        norm_x0, norm_y0, norm_dy, norm_padding = 0.0156, 0.0556, 0.0463, 0.0052
+        
+        # 출력 해상도에 맞게 스케일링
+        x0 = int(norm_x0 * output_width)
+        y0 = int(norm_y0 * output_height)
+        dy = int(norm_dy * output_height)
+        padding = int(norm_padding * output_width)
+        
+        # 폰트 크기도 출력 해상도에 맞게 스케일링
+        # 1920x1080 기준: font_scale=1, font_thickness=2
+        # 정규화: font_scale=1, font_thickness=2 (기본값 유지, 필요시 조정 가능)
+        base_font_scale = 1.0
+        base_font_thickness = 2
+        
+        # 출력 해상도에 따른 폰트 크기 조정 (1920x1080 기준으로 정규화)
+        scale_factor = min(output_width / 1920, output_height / 1080)
+        font_scale = base_font_scale * scale_factor
+        font_thickness = max(1, int(base_font_thickness * scale_factor))
+        
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1
-        font_thickness = 2
-        padding = 10
         
         max_width = 0
         for txt in overlay:
@@ -1750,12 +1769,22 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
         color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
 
-        # 미니맵 크기를 출력 해상도에 맞게 조정
-        mini_w = 400
+        # 미니맵 크기를 출력 해상도에 맞게 조정 (0~1 정규화 좌표 사용)
+        # 1920x1080 기준: mini_w=400, margin=20
+        # 정규화: mini_w=400/1920=0.2083, margin=20/1920=0.0104
+        
+        # 정규화된 크기 (0~1 범위)
+        norm_mini_width = 0.2083  # 화면 너비의 20.83%
+        norm_margin = 0.0104      # 화면 너비의 1.04%
+        
+        # 출력 해상도에 맞게 스케일링
+        mini_w = int(norm_mini_width * output_width)
         mini_h = int(output_height * mini_w / output_width)
+        margin = int(norm_margin * output_width)
+        
         mini_map = cv2.resize(color_hm, (mini_w, mini_h))
 
-        margin = 20
+        # 미니맵 위치 계산 (우상단)
         x_start = output_width - mini_w - margin
         y_start = margin
         
