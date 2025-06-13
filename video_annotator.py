@@ -13,6 +13,7 @@ Video people-tracking + congestion, line-cross counting, occupancy overlay
 import argparse
 import os
 import random
+import json
 from collections import defaultdict
 import threading
 import queue
@@ -68,19 +69,19 @@ def parse_args() -> argparse.Namespace:
                         help="Log detection results to label.txt")
     # Model
     parser.add_argument("--checkpoint", type=str,
-                        default="/works/samsung_prj/pretrain/yoloe-11l-seg.pt",
+                        default="pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
-                        default=["fish", "disco ball", "pig"],
+                        default=["pig", "disco ball", "object"],
                         help="Custom class names list (index order matters)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
     # Inference / tracking
     parser.add_argument("--image-size", type=int, default=640,
                         help="Inference image size")
-    parser.add_argument("--conf-thresh", type=float, default=0.1,
+    parser.add_argument("--conf-thresh", type=float, default=0.001,
                         help="Detection confidence threshold")
-    parser.add_argument("--vp-thresh", type=float, default=0.1,
+    parser.add_argument("--vp-thresh", type=float, default=0.3,
                         help="visual prompt confidence threshold")
     parser.add_argument("--iou-thresh", type=float, default=0.45,
                         help="Detection NMS IoU threshold")
@@ -110,7 +111,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
     parser.add_argument("--vpe-momentum", type=float, default=0.1,
-                        help="VPE moving average momentum")    
+                        help="VPE moving average momentum")
+    parser.add_argument("--limit-frame", type=int, default=300,
+                        help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
                         help="Image sharpening factor (0.0-1.0)")
@@ -120,7 +123,213 @@ def parse_args() -> argparse.Namespace:
                         help="Image brightness adjustment (-50 to 50)")
     parser.add_argument("--denoise", type=float, default=0.1,
                         help="Image denoising strength (0.0-1.0)")
+    
+    # Reference Image & Label First
+    parser.add_argument("--reference_img_path", type=str, default="videos/reference",
+                        help="Reference img file path")
+    parser.add_argument("--reference_label_path", type=str, default="videos/reference",
+                        help="Reference label file path (JSON format)")
     return parser.parse_args()
+
+# ─────────────────────── Loader ────────────────────────────── #
+def convert_data_to_visuals(data, score_threshold=0.5):
+    """
+    데이터 구조를 visuals 형태로 변환
+    data 구조:
+    {
+        'annotations': [
+            {
+                'bbox': [x, y, w, h],  # COCO format (x, y, width, height)
+                'category_id': 0,
+                'score': 0.95,
+                ...
+            }
+        ],
+        'categories': [{'id': 0, 'name': 'class0'}, ...]
+    }
+    
+    visuals 구조:
+    {
+        'bboxes': [np.array([[x1, y1, x2, y2], ...])],
+        'cls': [np.array([category_id, ...])]
+    }
+    
+    사용 예시:
+    # 데이터를 visuals 형태로 변환
+    visuals = convert_data_to_visuals(data)
+    
+    # 또는 신뢰도 필터링과 함께
+    visuals = convert_data_to_visuals(data, score_threshold=0.7)
+    """
+    if not data or 'annotations' not in data:
+        return dict(bboxes=[], cls=[])
+    
+    annotations = data['annotations']
+    
+    if not annotations:
+        return dict(bboxes=[], cls=[])
+    
+    # bbox 변환: COCO format [x, y, w, h] -> [x1, y1, x2, y2]
+    bboxes = []
+    class_ids = []
+    
+    for ann in annotations:
+        if 'bbox' in ann and 'category_id' in ann:
+            # 신뢰도 필터링 (score가 있는 경우)
+            if 'score' in ann and ann['score'] < score_threshold:
+                continue
+                
+            # COCO format to xyxy format 변환
+            x, y, w, h = ann['bbox']
+            x1, y1, x2, y2 = x, y, x + w, y + h
+            
+            bboxes.append([x1, y1, x2, y2])
+            class_ids.append(ann['category_id'])
+    
+    if not bboxes:
+        return dict(bboxes=[], cls=[])
+    
+    # visuals 형태로 변환
+    visuals = dict(
+        bboxes=[np.array(bboxes, dtype=np.float32)],
+        cls=[np.array(class_ids, dtype=np.int32)]
+    )
+    
+    return visuals
+
+
+def load_reference_from_json(json_path, class_names):
+    """
+    JSON 파일에서 레퍼런스 라벨을 로드하여 visuals 형태로 변환
+    
+    반환 형태:
+    {
+        'bboxes': [np.array([[x1, y1, x2, y2], ...])],
+        'cls': [np.array([class_id, ...])]
+    }
+    """
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # convert_data_to_visuals 함수 재사용
+        visuals = convert_data_to_visuals(data)
+        return visuals
+    
+    except Exception as e:
+        print(f"⚠️ JSON 파일 로드 오류: {e}")
+        return dict(bboxes=[], cls=[])
+
+
+def load_reference_pairs_from_folder(folder_path, class_names):
+    """
+    폴더에서 jpg/json 쌍을 찾아서 클래스별로 레퍼런스 데이터 로드
+    
+    Args:
+        folder_path: 레퍼런스 파일들이 있는 폴더 경로
+        class_names: 모델에서 사용할 클래스 이름 리스트
+    
+    Returns:
+        dict: {
+            'vp_classes': [...],  # VP로 처리할 클래스들
+            'tp_classes': [...],  # TP로 처리할 클래스들
+            'vp_data': {...},     # VP용 시각적 데이터
+            'reference_files': {...}  # 파일 정보
+        }
+    """
+    import glob
+    
+    if not os.path.exists(folder_path):
+        print(f"⚠️ 레퍼런스 폴더가 존재하지 않습니다: {folder_path}")
+        return {
+            'vp_classes': [],
+            'tp_classes': class_names,
+            'vp_data': dict(bboxes=[], cls=[]),
+            'reference_files': {}
+        }
+    
+    # jpg 파일들 찾기
+    jpg_files = glob.glob(os.path.join(folder_path, "*.jpg"))
+    
+    vp_classes = []      # VP로 처리할 클래스들
+    tp_classes = []      # TP로 처리할 클래스들  
+    vp_images = []       # VP용 이미지들
+    vp_bboxes = []       # VP용 바운딩 박스들
+    vp_cls = []          # VP용 클래스 ID들
+    reference_files = {} # 파일 정보 저장
+    
+    print(f"📁 레퍼런스 폴더 스캔: {folder_path}")
+    
+    for jpg_path in jpg_files:
+        # 파일명에서 확장자 제거하여 클래스명 추출
+        base_name = os.path.splitext(os.path.basename(jpg_path))[0]
+        json_path = os.path.join(folder_path, f"{base_name}.json")
+        
+        # 해당 json 파일이 존재하는지 확인
+        if os.path.exists(json_path):
+            print(f"   📄 발견: {base_name} (jpg + json)")
+            
+            # 클래스명이 args.names에 있는지 확인
+            if base_name in class_names:
+                # VP로 처리
+                class_id = class_names.index(base_name)
+                
+                # 이미지 로드
+                img = cv2.imread(jpg_path)
+                if img is not None:
+                    # JSON에서 바운딩 박스 로드
+                    visuals = load_reference_from_json(json_path, class_names)
+                    
+                    if visuals['bboxes'] and len(visuals['bboxes'][0]) > 0:
+                        vp_classes.append(base_name)
+                        vp_images.append(img)
+                        vp_bboxes.append(visuals['bboxes'][0])
+                        
+                        # 클래스 ID를 해당 클래스로 설정
+                        cls_array = np.full(len(visuals['bboxes'][0]), class_id, dtype=np.int32)
+                        vp_cls.append(cls_array)
+                        
+                        reference_files[base_name] = {
+                            'jpg': jpg_path,
+                            'json': json_path,
+                            'type': 'VP',
+                            'class_id': class_id
+                        }
+                        
+                        print(f"     ✅ VP 처리: {base_name} (class_id: {class_id})")
+                    else:
+                        print(f"     ⚠️ 빈 바운딩 박스: {base_name}")
+                else:
+                    print(f"     ❌ 이미지 로드 실패: {jpg_path}")
+            else:
+                print(f"     ⚠️ 클래스명 미등록: {base_name} (TP로 처리될 예정)")
+                reference_files[base_name] = {
+                    'jpg': jpg_path, 
+                    'json': json_path,
+                    'type': 'TP'
+                }
+        else:
+            print(f"   ⚠️ JSON 파일 없음: {base_name}")
+    
+    # TP로 처리할 클래스들 = args.names에서 VP 클래스들을 제외한 나머지
+    tp_classes = [name for name in class_names if name not in vp_classes]
+    
+    # VP 데이터 구성
+    vp_data = dict(bboxes=[], cls=[])
+    if vp_bboxes:
+        vp_data = dict(bboxes=vp_bboxes, cls=vp_cls)
+    
+    print(f"📊 레퍼런스 데이터 요약:")
+    print(f"   - VP 클래스 ({len(vp_classes)}개): {vp_classes}")
+    print(f"   - TP 클래스 ({len(tp_classes)}개): {tp_classes}")
+    
+    return {
+        'vp_classes': vp_classes,
+        'tp_classes': tp_classes, 
+        'vp_data': vp_data,
+        'vp_images': vp_images,
+        'reference_files': reference_files
+    }
 
 
 # ─────────────────────── Geometry helpers ────────────────────────────── #
@@ -338,11 +547,10 @@ class InferenceThread(threading.Thread):
     Frame Loading Thread → Inference Thread → Main Thread 파이프라인의 중간 단계
     """
     
-    def __init__(self, frame_queue, result_queue, model, model_vp, args):
+    def __init__(self, frame_queue, result_queue, model_vp, args):
         super().__init__(daemon=True)
         self.frame_queue = frame_queue
         self.result_queue = result_queue
-        self.model = model
         self.model_vp = model_vp
         self.args = args
         self.stop_event = threading.Event()
@@ -493,7 +701,7 @@ class InferenceThread(threading.Thread):
                 )
             else:
                 # 기본 모드로 추론
-                results = self.model.predict(
+                results = self.model_vp.predict(
                     source=batch_frames,
                     imgsz=self.args.image_size,
                     conf=0.05,
@@ -1315,6 +1523,10 @@ def main() -> None:
 
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps, total_frames = cap.get(cv2.CAP_PROP_FPS), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # 🔥 limit_frame에서 중단하도록 제한
+    total_frames = min(total_frames, args.limit_frame)
+    print(f"📹 프레임 처리 제한: {total_frames}프레임까지 처리 (limit: {args.limit_frame})")
 
     # Select frames to process
     frames_to_process = range(total_frames)
@@ -1347,24 +1559,146 @@ def main() -> None:
     )
     frame_loader.start()
     # print(f"🎬 Stage 1 시작: Frame Loading Thread (PID: {frame_loader.ident})")
+    
+    # ─────────────── Reference Data Loading ─────────── #
+    reference_data = load_reference_pairs_from_folder(args.reference_img_path, args.names)
+    
+    vp_classes = reference_data['vp_classes']
+    tp_classes = reference_data['tp_classes']
+    vp_data = reference_data['vp_data']
+    vp_images = reference_data['vp_images']
+    reference_files = reference_data['reference_files']
+    
+    # 🎨 VP 클래스들의 오버레이 이미지 생성
+    for i, (class_name, img) in enumerate(zip(vp_classes, vp_images)):
+        if class_name in reference_files:
+            # 해당 클래스의 바운딩 박스 가져오기  
+            bboxes = vp_data['bboxes'][i]
+            class_ids = vp_data['cls'][i]
+            
+            reference_overlay = img.copy()
+            
+            for j, (bbox, class_id) in enumerate(zip(bboxes, class_ids)):
+                x1, y1, x2, y2 = map(int, bbox)
+                
+                # 박스 그리기 (녹색)
+                cv2.rectangle(reference_overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # 클래스 라벨 그리기
+                if class_id < len(args.names):
+                    class_name_label = args.names[class_id]
+                    label = f"{class_name_label} ({j+1})"
+                    
+                    # 텍스트 크기 계산
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.6
+                    thickness = 2
+                    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                    
+                    # 라벨 배경 그리기
+                    cv2.rectangle(reference_overlay, (x1, y1 - text_h - baseline - 10), 
+                                  (x1 + text_w, y1), (0, 255, 0), -1)
+                    
+                    # 텍스트 그리기
+                    cv2.putText(reference_overlay, label, (x1, y1 - baseline - 5), 
+                                font, font_scale, (255, 255, 255), thickness)
+            
+            # 오버레이된 레퍼런스 이미지 저장
+            overlay_path = os.path.join(output_dir, f"reference_overlay_{class_name}.jpg")
+            cv2.imwrite(overlay_path, reference_overlay)
+            print(f"📸 VP 오버레이 저장: {overlay_path}")
 
     # ─────────────── Model & palette ─────────── #
-    model = YOLOE(args.checkpoint)
-    model.eval()
-    model.to(args.device)
-    model.set_classes(args.names, model.get_text_pe(args.names))
-
     # VP 모델 별도 로드
     model_vp = YOLOE(args.checkpoint)
     model_vp.eval()
     model_vp.to(args.device)
-    model_vp.set_classes(args.names, model_vp.get_text_pe(args.names))
+    
+    # 🧠 VP & TP Embedding 추출
+    final_vpe = None
+    
+    if vp_classes:
+        print(f"\n🎯 VP Embedding 추출 중... ({len(vp_classes)}개 클래스)")
+        
+        # VP용 이미지들을 PIL로 변환
+        vp_pil_images = []
+        for img in vp_images:
+            frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            pil_frame = Image.fromarray(frame_rgb)
+            vp_pil_images.append(pil_frame)
+        
+        # VP Embedding 추출
+        model_vp.predict(
+            source=vp_pil_images, 
+            prompts=vp_data, 
+            predictor=YOLOEVPSegPredictor, 
+            return_vpe=True,
+            verbose=False
+        )
+        
+        if hasattr(model_vp, 'predictor') and hasattr(model_vp.predictor, 'vpe'):
+            vp_embedding = model_vp.predictor.vpe
+            print(f"✅ VP Embedding 추출 완료: {vp_embedding.shape}")
+            
+            # 배치 차원이 있으면 평균화
+            if len(vp_embedding.shape) > 2:
+                vp_embedding = vp_embedding.mean(dim=0, keepdim=True)
+                
+            final_vpe = vp_embedding
+        else:
+            print("⚠️ VP Embedding 추출 실패")
+    
+    if tp_classes:
+        print(f"\n📝 TP Embedding 추출 중... ({len(tp_classes)}개 클래스)")
+        
+        # TP Embedding 추출
+        tp_embedding = model_vp.get_text_pe(tp_classes)
+        print(f"✅ TP Embedding 추출 완료: {tp_embedding.shape}")
+        
+        # VP와 TP Embedding 결합
+        if final_vpe is not None:
+            # VP와 TP를 결합 (클래스 순서 맞춤)
+            combined_embeddings = []
+            
+            for class_name in args.names:
+                if class_name in vp_classes:
+                    # VP에서 해당 클래스의 embedding 가져오기
+                    vp_idx = vp_classes.index(class_name)
+                    if len(final_vpe.shape) == 3:  # (batch, classes, features)
+                        class_embedding = final_vpe[:, vp_idx:vp_idx+1, :]
+                    else:  # (classes, features)
+                        class_embedding = final_vpe[vp_idx:vp_idx+1, :]
+                    combined_embeddings.append(class_embedding)
+                elif class_name in tp_classes:
+                    # TP에서 해당 클래스의 embedding 가져오기
+                    tp_idx = tp_classes.index(class_name)
+                    if len(tp_embedding.shape) == 3:  # (batch, classes, features)
+                        class_embedding = tp_embedding[:, tp_idx:tp_idx+1, :]
+                    else:  # (classes, features)
+                        class_embedding = tp_embedding[tp_idx:tp_idx+1, :]
+                    combined_embeddings.append(class_embedding)
+            
+            if combined_embeddings:
+                final_vpe = torch.cat(combined_embeddings, dim=-2)  # 클래스 차원으로 결합
+                print(f"🔗 VP+TP Embedding 결합 완료: {final_vpe.shape}")
+        else:
+            final_vpe = tp_embedding
+            print(f"📝 TP Embedding만 사용: {final_vpe.shape}")
+    
+    if final_vpe is None:
+        print("⚠️ 사용 가능한 embedding이 없습니다. 기본 모드로 실행됩니다.")
+        args.cross_vp = False
+    else:
+        # 모델에 최종 VPE 설정
+        model_vp.set_classes(args.names, final_vpe)
+        print(f"🎯 최종 VPE 설정 완료: {args.names}")
+    
+    model_vp.predictor = None
 
     # Inference Thread 시작
     inference_thread = InferenceThread(
         frame_queue=frame_queue,
         result_queue=result_queue,
-        model=model,
         model_vp=model_vp,
         args=args
     )
