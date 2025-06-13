@@ -277,6 +277,7 @@ def calculate_mask_polygon_overlap(mask, polygon, image_shape):
         print(f"⚠️ mask-polygon 겹침 계산 오류: {e}")
         return 0.0
 
+# NOTE Check ROI Access
 def check_roi_access(obj, polygon, method, bbox_threshold, mask_threshold, image_shape):
     """객체가 ROI에 접근했는지 확인"""
     if method == 'bbox':
