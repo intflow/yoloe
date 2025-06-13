@@ -64,8 +64,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -462,9 +462,15 @@ class ROIAccessManager:
             # 1. 현재 ROI에 없는 객체들 확인
             for track_id in roi_stat['current_tracks']:
                 if track_id not in current_roi_tracks:
-                    # ROI에서 나간 객체 → 퇴장 대기 상태로 이동
+                    # 🎯 ROI에서 나간 객체 → counted=True인 객체만 퇴장 대기 상태로 이동
                     if track_id not in roi_stat['exit_pending_tracks']:
-                        tracks_to_exit_pending.append(track_id)
+                        track_info = roi_stat['current_tracks'][track_id]
+                        if track_info.get('counted', False):
+                            # 접근이 확인된 객체만 퇴장 대기로 이동
+                            tracks_to_exit_pending.append(track_id)
+                        else:
+                            # 접근 미확인 객체는 바로 제거
+                            tracks_to_remove.append(track_id)
             
             # 2. 퇴장 대기 상태로 이동
             for track_id in tracks_to_exit_pending:
@@ -510,6 +516,36 @@ class ROIAccessManager:
             all_tracks = active_tracks.union(pending_tracks)
             current_tracks[roi_name] = list(all_tracks)
         return current_tracks
+    
+    def get_roi_tracks_by_status(self):
+        """🎯 ROI 상태별 track_id들을 반환 (3단계 구분)"""
+        roi_tracks_status = {}
+        
+        for roi_name, roi_stat in self.roi_stats.items():
+            # 각 ROI별로 상태별 track_id 분류
+            pending_access = []    # 접근 확인 대기
+            confirmed_access = []  # 접근 확인
+            exit_pending = []      # 퇴장 대기
+            
+            # 1. current_tracks에서 접근 확인 대기 vs 접근 확인 구분
+            for track_id, track_info in roi_stat['current_tracks'].items():
+                if track_info.get('counted', False):
+                    # 접근이 확인된 상태
+                    confirmed_access.append(track_id)
+                else:
+                    # 아직 접근 확인 대기 상태
+                    pending_access.append(track_id)
+            
+            # 2. exit_pending_tracks는 모두 퇴장 대기 상태
+            exit_pending = list(roi_stat['exit_pending_tracks'].keys())
+            
+            roi_tracks_status[roi_name] = {
+                'pending_access': pending_access,      # 빨간색 점선
+                'confirmed_access': confirmed_access,  # 빨간색 실선
+                'exit_pending': exit_pending          # 빨간색 점선
+            }
+        
+        return roi_tracks_status
     
     def get_statistics(self):
         """최종 통계 반환"""
@@ -630,22 +666,82 @@ def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
     
     return image
 
-def highlight_roi_objects(image, tracked_objects, current_roi_tracks, color_palette):
-    """현재 ROI에 있는 객체들을 하이라이트"""
-    # 모든 ROI에 있는 track_id들 수집
-    all_roi_track_ids = set()
-    for roi_tracks in current_roi_tracks.values():
-        all_roi_track_ids.update(roi_tracks)
+def highlight_roi_objects(image, tracked_objects, roi_tracks_status, color_palette):
+    """🎯 ROI 상태별로 객체들을 하이라이트 (3단계 구분)"""
     
-    # ROI에 있는 객체들에 빨간색 하이라이트 추가
+    # 모든 ROI의 상태별 track_id들 수집
+    confirmed_track_ids = set()  # 접근 확인 (빨간색 실선)
+    pending_track_ids = set()    # 접근 확인 대기 + 퇴장 대기 (빨간색 점선)
+    
+    for roi_name, status_dict in roi_tracks_status.items():
+        confirmed_track_ids.update(status_dict['confirmed_access'])
+        pending_track_ids.update(status_dict['pending_access'])
+        pending_track_ids.update(status_dict['exit_pending'])
+    
+    # 빨간색 정의
+    red_color = (255, 0, 0)  # BGR 형식
+    thickness = 4
+    
     for obj in tracked_objects:
-        if obj.track_id in all_roi_track_ids:
+        if obj.track_id in confirmed_track_ids:
+            # 접근 확인된 객체 → 빨간색 실선 테두리
             x1, y1, x2, y2 = map(int, obj.box)
+            cv2.rectangle(image, (x1-2, y1-2), (x2+2, y2+2), red_color, thickness)
             
-            # 빨간색 굵은 테두리 추가
-            cv2.rectangle(image, (x1-2, y1-2), (x2+2, y2+2), (255, 0, 0), 4)
+        elif obj.track_id in pending_track_ids:
+            # 접근 확인 대기 또는 퇴장 대기 객체 → 빨간색 점선 테두리
+            x1, y1, x2, y2 = map(int, obj.box)
+            draw_dashed_rectangle(image, (x1-2, y1-2), (x2+2, y2+2), red_color, thickness)
     
     return image
+
+def draw_dashed_rectangle(image, pt1, pt2, color, thickness, dash_length=10):
+    """🎨 점선으로 사각형 그리기"""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    # 4개 변을 각각 점선으로 그리기
+    # 상단 변
+    draw_dashed_line(image, (x1, y1), (x2, y1), color, thickness, dash_length)
+    # 하단 변  
+    draw_dashed_line(image, (x1, y2), (x2, y2), color, thickness, dash_length)
+    # 좌측 변
+    draw_dashed_line(image, (x1, y1), (x1, y2), color, thickness, dash_length)
+    # 우측 변
+    draw_dashed_line(image, (x2, y1), (x2, y2), color, thickness, dash_length)
+
+def draw_dashed_line(image, pt1, pt2, color, thickness, dash_length=10):
+    """🎨 점선 그리기"""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    # 선분의 총 길이 계산
+    total_length = int(np.sqrt((x2 - x1)**2 + (y2 - y1)**2))
+    
+    if total_length == 0:
+        return
+    
+    # 단위 벡터 계산
+    dx = (x2 - x1) / total_length
+    dy = (y2 - y1) / total_length
+    
+    # 점선 그리기
+    current_length = 0
+    while current_length < total_length:
+        # 현재 점 계산
+        start_x = int(x1 + dx * current_length)
+        start_y = int(y1 + dy * current_length)
+        
+        # 다음 점 계산 (dash_length만큼 이동)
+        end_length = min(current_length + dash_length, total_length)
+        end_x = int(x1 + dx * end_length)
+        end_y = int(y1 + dy * end_length)
+        
+        # 실선 구간 그리기
+        cv2.line(image, (start_x, start_y), (end_x, end_y), color, thickness)
+        
+        # 다음 구간으로 이동 (공백 포함)
+        current_length += dash_length * 2
 
 def draw_detection_area(image, detection_area_polygon, scale_x=1.0, scale_y=1.0):
     """기본 감지 영역을 연두색 테두리로 그리기"""
@@ -836,7 +932,7 @@ def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
     return image
 
 def draw_label(image, box, track_id, class_name, confidence, color_palette):
-    """라벨 그리기"""
+    """🏷️ 라벨 그리기 (이미지 경계 고려)"""
     x1, y1, x2, y2 = map(int, box)
     color = color_palette.by_idx(track_id).as_bgr()
     
@@ -849,13 +945,32 @@ def draw_label(image, box, track_id, class_name, confidence, color_palette):
     thickness = 2
     (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
     
+    # 이미지 크기 가져오기
+    img_height, img_width = image.shape[:2]
+    
+    # 라벨 높이 계산 (패딩 포함)
+    label_height = text_h + baseline + 10
+    
+    # 🎯 라벨 위치 결정: bbox 위쪽에 공간이 있는지 확인
+    if y1 - label_height >= 0:
+        # bbox 위쪽에 충분한 공간이 있음 → 위쪽에 그리기 (기존 방식)
+        label_y_top = y1 - text_h - baseline - 10
+        label_y_bottom = y1
+        text_y = y1 - baseline - 5
+    else:
+        label_y_top = y1
+        label_y_bottom = y1 + text_h + baseline + 10
+        text_y = y1 + text_h + 5
+    
+    # 라벨이 이미지 우측을 벗어나는 경우 x 좌표 조정
+    if x1 + text_w >= img_width:
+        x1 = max(0, img_width - text_w)
+    
     # 라벨 배경 그리기
-    cv2.rectangle(image, (x1, y1 - text_h - baseline - 10), 
-                  (x1 + text_w, y1), color, -1)
+    cv2.rectangle(image, (x1, label_y_top), (x1 + text_w, label_y_bottom), color, -1)
     
     # 텍스트 그리기
-    cv2.putText(image, label, (x1, y1 - baseline - 5), 
-                font, font_scale, (255, 255, 255), thickness)
+    cv2.putText(image, label, (x1, text_y), font, font_scale, (255, 255, 255), thickness)
     
     return image
 
@@ -1685,10 +1800,10 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
         tracked_objects = tracker.update(detected_objects, original_frame, "None")
         
         # ROI Access Detection 업데이트
-        current_roi_tracks = {}
+        roi_tracks_status = {}
         if roi_manager is not None:
             roi_manager.update(tracked_objects, frame_idx, original_frame.shape)
-            current_roi_tracks = roi_manager.get_current_roi_tracks()
+            roi_tracks_status = roi_manager.get_roi_tracks_by_status()
         
         # 기존 변수들 추출 (호환성 유지)
         if tracked_objects:
@@ -1776,10 +1891,10 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
             annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
                                         roi_manager.roi_names, roi_manager.roi_stats)
         
-            # ROI에 있는 객체들 하이라이트 (스케일링된 객체로)
+            # 🎯 ROI에 있는 객체들 상태별 하이라이트 (스케일링된 객체로)
             if tracked_objects:
                 annotated = highlight_roi_objects(annotated, scaled_objects, 
-                                                current_roi_tracks, palette)
+                                                roi_tracks_status, palette)
 
         # Occupancy 업데이트
         raw_occupancy = int(np.sum(class_ids == person_class_id))
