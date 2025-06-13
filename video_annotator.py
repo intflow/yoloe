@@ -64,8 +64,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
                         help="Detection NMS IoU threshold")
     parser.add_argument("--track-history", type=int, default=100,
                         help="Frames kept in trajectory history")
-    parser.add_argument("--track-det-thresh", type=float, default=0.1,
+    parser.add_argument("--track-det-thresh", type=float, default=0.2,
                         help="Detection confidence threshold for tracking")
     parser.add_argument("--track-iou-thresh", type=float, default=0.3,
                         help="Tracking IoU threshold")
@@ -147,10 +147,14 @@ def parse_args() -> argparse.Namespace:
                         help="Minimum mask overlap ratio for ROI detection")
     parser.add_argument("--roi-exit-grace-time", type=float, default=2.0,
                         help="Grace time in seconds before removing objects that left ROI")
+    # NOTE [args] Detection area
+    parser.add_argument("--detection-area", type=str, 
+                        default="192,0,951,0,997,356,938,719,232,719,153,348",
+                        help="Basic detection area as polygon coordinates (e.g., '100,100,500,100,500,400,100,400')")
     # Output resolution
-    parser.add_argument("--output-width", type=int, default=1280,
+    parser.add_argument("--output-width", type=int, default=1920,
                         help="Output video width (if not set, uses input width)")
-    parser.add_argument("--output-height", type=int, default=720,
+    parser.add_argument("--output-height", type=int, default=1080,
                         help="Output video height (if not set, uses input height)")
     return parser.parse_args()
 
@@ -215,6 +219,38 @@ def parse_roi_names(roi_names_str, num_zones):
         names.append(f"Zone_{len(names)}")
     
     return names[:num_zones]  # 초과하는 이름은 제거
+
+def parse_detection_area(detection_area_str):
+    """기본 감지 영역 문자열을 파싱하여 polygon으로 변환"""
+    if not detection_area_str:
+        return None
+    
+    try:
+        # 문자열을 숫자 리스트로 파싱
+        coords = [float(x.strip()) for x in detection_area_str.split(',')]
+        
+        if len(coords) < 6 or len(coords) % 2 != 0:
+            print(f"⚠️ 기본 감지 영역 좌표가 잘못됨: {coords} (최소 3개 점 필요)")
+            return None
+        
+        # [x1,y1,x2,y2,x3,y3,...] → [(x1,y1), (x2,y2), (x3,y3), ...]
+        points = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+        
+        try:
+            polygon = Polygon(points)
+            if polygon.is_valid:
+                print(f"✅ 기본 감지 영역 설정 완료: {len(points)}개 점")
+                return polygon
+            else:
+                print(f"⚠️ 유효하지 않은 기본 감지 영역: {points}")
+                return None
+        except Exception as e:
+            print(f"⚠️ 기본 감지 영역 Polygon 생성 실패: {points}, 오류: {e}")
+            return None
+    
+    except Exception as e:
+        print(f"💥 기본 감지 영역 파싱 오류: {e}")
+        return None
 
 def calculate_bbox_polygon_overlap(bbox, polygon):
     """bbox와 polygon의 겹침 비율 계산"""
@@ -308,6 +344,22 @@ def check_roi_access(obj, polygon, method, bbox_threshold, mask_threshold, image
             return True
     
     return False
+
+def is_bbox_center_in_polygon(bbox, polygon):
+    """bbox의 center가 polygon 내부에 있는지 확인"""
+    try:
+        x1, y1, x2, y2 = bbox
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        
+        from shapely.geometry import Point
+        center_point = Point(center_x, center_y)
+        
+        return polygon.contains(center_point)
+    
+    except Exception as e:
+        print(f"⚠️ Bbox center in polygon 검사 오류: {e}")
+        return True  # 오류시 기본적으로 포함된 것으로 처리
 
 
 # ─────────────────────── ROI Access Manager Class ────────────────────────────── #
@@ -595,16 +647,64 @@ def highlight_roi_objects(image, tracked_objects, current_roi_tracks, color_pale
     
     return image
 
+def draw_detection_area(image, detection_area_polygon, scale_x=1.0, scale_y=1.0):
+    """기본 감지 영역을 연두색 테두리로 그리기"""
+    if detection_area_polygon is None:
+        return image
+    
+    try:
+        # polygon 좌표 추출 및 스케일링
+        coords = np.array(detection_area_polygon.exterior.coords, dtype=np.float32)
+        scaled_coords = coords * [scale_x, scale_y]
+        scaled_coords = scaled_coords.astype(np.int32)
+        
+        # 연두색 (BGR: 0, 255, 0) 테두리로 그리기
+        lime_green = (83, 255, 76)
+        thickness = 8
+        
+        cv2.polylines(image, [scaled_coords], isClosed=True, color=lime_green, thickness=thickness)
+        
+        # # 기본 감지 영역 라벨 표시 (polygon의 중심점에)
+        # try:
+        #     centroid = detection_area_polygon.centroid
+        #     text_x = int(centroid.x * scale_x)
+        #     text_y = int(centroid.y * scale_y)
+            
+        #     text = "Detection Area"
+        #     font = cv2.FONT_HERSHEY_SIMPLEX
+        #     font_scale = 0.8
+        #     thickness = 2
+        #     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            
+        #     # 배경 사각형 (연두색)
+        #     cv2.rectangle(image, (text_x - 5, text_y - text_h - 10), 
+        #                  (text_x + text_w + 5, text_y + 5), lime_green, -1)
+            
+        #     # 텍스트 (검은색)
+        #     cv2.putText(image, text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness)
+            
+        # except Exception as e:
+        #     print(f"⚠️ 기본 감지 영역 라벨 그리기 오류: {e}")
+        
+    except Exception as e:
+        print(f"💥 기본 감지 영역 그리기 오류: {e}")
+    
+    return image
+
 
 # ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
-def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
+def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=None) -> tuple[list[ObjectMeta], int]:
     """
-    CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환
+    CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환 (기본 감지 영역 필터링 포함)
+    
+    Returns:
+        tuple: (filtered_objects, filtered_count) - 필터링된 객체 리스트와 필터링된 객체 수
     """
     objects = []
+    filtered_count = 0  # 필터링된 객체 수 (통계용)
     
     if not cpu_result['has_boxes']:
-        return objects
+        return objects, filtered_count
     
     boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
     confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
@@ -677,9 +777,14 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
             class_name=class_names[class_ids[i]],
             track_id=None  # 트래커에서 부여받을 예정
         )
-        objects.append(obj)
+        
+        # 🎯 기본 감지 영역 필터링 (있는 경우에만)
+        if detection_area_polygon is None or is_bbox_center_in_polygon(obj.box, detection_area_polygon):
+            objects.append(obj)  # 조건 만족시에만 추가
+        else:
+            filtered_count += 1  # 필터링된 객체 수 증가
     
-    return objects
+    return objects, filtered_count
 
 
 # ─────────────────────── Direct Overlay Functions ────────────────────────────── #
@@ -797,26 +902,32 @@ class InferenceThread(threading.Thread):
     Frame Loading Thread → Inference Thread → Main Thread 파이프라인의 중간 단계
     """
     
-    def __init__(self, frame_queue, result_queue, model, model_vp, args):
+    def __init__(self, frame_queue, result_queue, model, model_vp, args, detection_area_polygon=None):
         super().__init__(daemon=True)
         self.frame_queue = frame_queue
         self.result_queue = result_queue
         self.model = model
         self.model_vp = model_vp
         self.args = args
+        self.detection_area_polygon = detection_area_polygon  # 결과 패키징에서 사용
         self.stop_event = threading.Event()
         self.prev_vpe = None  # VPE 상태 관리
         self.stats = {
             'total_batches_processed': 0,
             'total_frames_processed': 0,
             'vpe_updates': 0,
-            'failed_batches': 0
+            'failed_batches': 0,
+            'filtered_objects': 0  # 필터링된 객체 수 통계 추가
         }
         
         print(f"\n🧠 Inference Thread 초기화:")
         print(f"   - GPU 디바이스: {args.device}")
         print(f"   - Cross-VP 모드: {'활성화' if args.cross_vp else '비활성화'}")
+        print(f"   - Inference Confidence Threshold: {args.conf_thresh}")
+        print(f"   - VP Confidence Threshold: {args.vp_thresh}")
+        print(f"   - Inference IoU Threshold: {args.iou_thresh}")
         print(f"   - VPE 모멘텀: {args.vpe_momentum}")
+        print(f"   - 기본 감지 영역: {'설정됨' if detection_area_polygon else '미설정'}")
     
     def stop(self):
         """스레드 종료 요청"""
@@ -845,7 +956,7 @@ class InferenceThread(threading.Thread):
                     # 배치 데이터 언패킹
                     batch_frames = batch_data['batch_frames']
                     batch_indices = batch_data['batch_indices']
-                    batch_original_frames = batch_data['batch_original_frames']
+                    # batch_original_frames = batch_data['batch_original_frames']
                     loaded_count = batch_data['loaded_count']
                     
                     if not batch_frames:
@@ -867,9 +978,24 @@ class InferenceThread(threading.Thread):
                     if self.args.cross_vp:
                         vpe_updated = self._update_vpe(batch_results)
                     
-                    # 결과 패키징
+                    # 🎯 결과 패키징: 여기서 cpu_result → ObjectMeta 변환! (딱 한 번만!)
+                    batch_detected_objects = []  # ObjectMeta 리스트들
+                    batch_original_frames = []   # 원본 프레임들
+                    
+                    for cpu_result in batch_results:
+                        # 🎯 cpu_result → ObjectMeta 변환 + 기본 감지 영역 필터링
+                        detected_objects, filtered_count = convert_results_to_objects(
+                            cpu_result, self.args.names, self.detection_area_polygon
+                        )
+                        
+                        # 필터링 통계 업데이트
+                        self.stats['filtered_objects'] += filtered_count
+                        
+                        batch_detected_objects.append(detected_objects)
+                        batch_original_frames.append(cpu_result['orig_img'])
+                    
                     result_data = {
-                        'batch_results': batch_results,
+                        'batch_detected_objects': batch_detected_objects,  # ObjectMeta 리스트들
                         'batch_indices': batch_indices,
                         'batch_original_frames': batch_original_frames,
                         'loaded_count': loaded_count,
@@ -931,6 +1057,7 @@ class InferenceThread(threading.Thread):
             print(f"   - 처리된 프레임 수: {self.stats['total_frames_processed']}")
             print(f"   - VPE 업데이트 횟수: {self.stats['vpe_updates']}")
             print(f"   - 실패한 배치 수: {self.stats['failed_batches']}")
+            print(f"   - 기본 감지 영역에서 필터링된 객체 수: {self.stats['filtered_objects']}")
             print("🚀 GPU 메모리 완전 정리 완료!")
     
     def _inference_batch(self, batch_frames):
@@ -962,6 +1089,7 @@ class InferenceThread(threading.Thread):
             
             # 🔥 GPU → CPU 변환을 여기서 수행하여 메모리 효율성 확보!
             cpu_results = []
+            
             for result in results:
                 cpu_result = {
                     'boxes_xyxy': result.boxes.xyxy.cpu().numpy() if len(result.boxes) > 0 else np.empty((0, 4)),
@@ -1137,6 +1265,10 @@ class InferenceThread(threading.Thread):
             import torch
             torch.cuda.empty_cache()
             return None
+    
+
+    
+
 
 
 # ─────────────────────── Frame Loading Thread Class ────────────────────────────── #
@@ -1509,7 +1641,7 @@ def preprocess_image(image, args):
     return img
 
 # ANCHOR Detection Result Processing
-def process_batch_results(batch_results, batch_indices, batch_original_frames, 
+def process_batch_results(batch_detected_objects, batch_indices, batch_original_frames, 
                          tracker, args, fps, palette, person_class_id,
                          # 상태 변수들
                          track_history, track_side, track_color, 
@@ -1523,7 +1655,9 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                          # Progress bar & Queue monitoring
                          pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None,
                          # ROI Access Detection
-                         roi_manager=None):
+                         roi_manager=None,
+                         # Basic Detection Area
+                         detection_area_polygon=None):
     """Batch 결과를 개별 프레임으로 처리 (CPU 데이터 기반)"""
     
     updated_state = {
@@ -1535,7 +1669,7 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         'last_save_frame': last_save_frame
     }
     
-    for cpu_result, frame_idx, original_frame in zip(batch_results, batch_indices, batch_original_frames):
+    for detected_objects, frame_idx, original_frame in zip(batch_detected_objects, batch_indices, batch_original_frames):
         # 시간 계산
         current_time = frame_idx / fps
         hours = int(current_time // 3600)
@@ -1544,16 +1678,16 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         milliseconds = int((current_time % 1) * 1000)
         time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
         
-        # ObjectMeta 변환 (CPU 데이터 기반)
-        detected_objects = convert_results_to_objects(cpu_result, args.names)
+        # 🚀 ObjectMeta 이미 준비됨! (InferenceThread에서 변환 + 필터링 완료)
+        # detected_objects는 이미 필터링된 ObjectMeta 리스트
         
         # Tracker 업데이트 (기존 로직 유지)
-        tracked_objects = tracker.update(detected_objects, cpu_result['orig_img'], "None")
+        tracked_objects = tracker.update(detected_objects, original_frame, "None")
         
         # ROI Access Detection 업데이트
         current_roi_tracks = {}
         if roi_manager is not None:
-            roi_manager.update(tracked_objects, frame_idx, cpu_result['orig_img'].shape)
+            roi_manager.update(tracked_objects, frame_idx, original_frame.shape)
             current_roi_tracks = roi_manager.get_current_roi_tracks()
         
         # 기존 변수들 추출 (호환성 유지)
@@ -1598,20 +1732,9 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         
         annotated = frame_rgb.copy()
         
-        # ROI 시각화 (출력 해상도에 맞게 스케일링)
-        if roi_manager is not None:
-            # ROI polygon을 출력 해상도에 맞게 스케일링
-            scaled_roi_polygons = []
-            for polygon in roi_manager.roi_polygons:
-                coords = np.array(polygon.exterior.coords)
-                scaled_coords = coords * [scale_x, scale_y]
-                from shapely.geometry import Polygon
-                scaled_polygon = Polygon(scaled_coords)
-                scaled_roi_polygons.append(scaled_polygon)
-            
-            # ROI polygon 그리기 (스케일링된 좌표로)
-            annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
-                                        roi_manager.roi_names, roi_manager.roi_stats)        
+        # 기본 감지 영역 시각화 (출력 해상도에 맞게 스케일링)
+        if detection_area_polygon is not None:
+            annotated = draw_detection_area(annotated, detection_area_polygon, scale_x, scale_y)    
         
         # 객체 오버레이 (스케일링된 좌표로)
         scaled_objects = []
@@ -1637,9 +1760,23 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                 scaled_objects.append(scaled_obj)
             
             annotated = draw_objects_overlay(annotated, scaled_objects, palette)
-        
-        # ROI에 있는 객체들 하이라이트 (스케일링된 객체로)
+
+        # ROI 시각화 (출력 해상도에 맞게 스케일링)
         if roi_manager is not None:
+            # ROI polygon을 출력 해상도에 맞게 스케일링
+            scaled_roi_polygons = []
+            for polygon in roi_manager.roi_polygons:
+                coords = np.array(polygon.exterior.coords)
+                scaled_coords = coords * [scale_x, scale_y]
+                from shapely.geometry import Polygon
+                scaled_polygon = Polygon(scaled_coords)
+                scaled_roi_polygons.append(scaled_polygon)
+            
+            # ROI polygon 그리기 (스케일링된 좌표로)
+            annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
+                                        roi_manager.roi_names, roi_manager.roi_stats)
+        
+            # ROI에 있는 객체들 하이라이트 (스케일링된 객체로)
             if tracked_objects:
                 annotated = highlight_roi_objects(annotated, scaled_objects, 
                                                 current_roi_tracks, palette)
@@ -1936,13 +2073,23 @@ def main() -> None:
     model_vp.to(args.device)
     model_vp.set_classes(args.names, model_vp.get_text_pe(args.names))
 
+    # ─────────────── 기본 감지 영역 설정 ──────────────── #
+    detection_area_polygon = None
+    if args.detection_area:
+        detection_area_polygon = parse_detection_area(args.detection_area)
+        if detection_area_polygon is None:
+            print("⚠️ 기본 감지 영역 파싱 실패, 기본 감지 영역 기능 비활성화")
+    else:
+        print("🎯 기본 감지 영역 미설정, 모든 객체 감지")    
+
     # Inference Thread 시작
     inference_thread = InferenceThread(
         frame_queue=frame_queue,
         result_queue=result_queue,
         model=model,
         model_vp=model_vp,
-        args=args
+        args=args,
+        detection_area_polygon=detection_area_polygon
     )
     inference_thread.start()
     # print(f"🧠 Stage 2 시작: Inference Thread (PID: {inference_thread.ident})")
@@ -2068,7 +2215,7 @@ def main() -> None:
                     break
                 
                 # 결과 데이터 언패킹
-                batch_results = result_data['batch_results']
+                batch_detected_objects = result_data['batch_detected_objects']
                 batch_indices = result_data['batch_indices']
                 batch_original_frames = result_data['batch_original_frames']
                 loaded_count = result_data['loaded_count']
@@ -2078,14 +2225,14 @@ def main() -> None:
                 
                 # print(f"📊 Main Thread: Batch {batch_idx + 1} 처리 시작 ({loaded_count} 프레임)")
                 
-                if not batch_results:
+                if not batch_detected_objects:
                     print("⚠️ 빈 결과 수신, 건너뛰기")
                     batch_idx += 1
                     continue
                 
                 # ──────── 3. Batch 결과 처리 (CPU 작업) ──────── #
                 updated_state = process_batch_results(
-                    batch_results, batch_indices, batch_original_frames,
+                    batch_detected_objects, batch_indices, batch_original_frames,
                     tracker, args, fps, palette, person_class_id,
                     # 상태 변수들
                     track_history, track_side, track_color, 
@@ -2099,7 +2246,9 @@ def main() -> None:
                     # Progress bar & Queue monitoring
                     pbar, frame_queue, result_queue, pipeline_stats,
                     # ROI Access Detection
-                    roi_manager
+                    roi_manager,
+                    # Basic Detection Area
+                    detection_area_polygon
                 )
                 
                 # 상태 변수 업데이트
@@ -2246,6 +2395,7 @@ def main() -> None:
         print(f"   - 처리된 프레임 수: {inference_stats['total_frames_processed']}")
         print(f"   - VPE 업데이트 횟수: {inference_stats['vpe_updates']}")
         print(f"   - 실패한 배치 수: {inference_stats['failed_batches']}")
+        print(f"   - 기본 감지 영역 필터링된 객체 수: {inference_stats['filtered_objects']}")
         
         # GPU 효율성 계산
         if inference_stats['total_batches_processed'] > 0:
