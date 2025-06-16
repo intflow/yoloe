@@ -38,6 +38,41 @@ from tracker.boostTrack.boost_track import BoostTrack
 _debug_frame_count = 0
 _max_debug_frames = 5  # 처음 5프레임만 디버깅 출력
 
+# ────────────────────────────── Global Statistics ──────────────────────────────────── #
+class ConfidenceStats:
+    """Confidence 분포 통계를 추적하는 클래스"""
+    def __init__(self):
+        self.high_conf_count = 0
+        self.medium_conf_count = 0
+        self.low_conf_count = 0
+        self.very_low_conf_count = 0
+    
+    def update(self, high_count, medium_count, low_count, very_low_count):
+        self.high_conf_count += high_count
+        self.medium_conf_count += medium_count
+        self.low_conf_count += low_count
+        self.very_low_conf_count += very_low_count
+    
+    def get_total(self):
+        return self.high_conf_count + self.medium_conf_count + self.low_conf_count + self.very_low_conf_count
+    
+    def print_stats(self, args):
+        total = self.get_total()
+        print(f"📊 Confidence 분포 (전체):")
+        print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {self.high_conf_count}개")
+        print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {self.medium_conf_count}개")
+        print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {self.low_conf_count}개")
+        print(f"   - 초저신뢰도 (<{args.very_low_conf_thresh}): {self.very_low_conf_count}개")
+        if total > 0:
+            print(f"   - 총 detection 수: {total}개")
+            print(f"   - 고신뢰도 비율: {self.high_conf_count/total*100:.1f}%")
+            print(f"   - 중신뢰도 비율: {self.medium_conf_count/total*100:.1f}%")
+            print(f"   - 저신뢰도 비율: {self.low_conf_count/total*100:.1f}%")
+            print(f"   - 초저신뢰도 비율: {self.very_low_conf_count/total*100:.1f}%")
+
+# 전역 통계 객체
+confidence_stats = ConfidenceStats()
+
 # ────────────────────────────── ObjectMeta Class ──────────────────────────── #
 class ObjectMeta:
     """
@@ -76,8 +111,8 @@ def parse_args() -> argparse.Namespace:
                         default="pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
     parser.add_argument("--names", nargs="+",
-                        default=["fish", "disco ball", "object"],
-                        # default=["pig", "disco ball", "object"],
+                        # default=["fish", "disco ball", "object"],
+                        default=["pig", "disco ball", "object"],
                         help="Custom class names list (index order matters)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
@@ -108,16 +143,16 @@ def parse_args() -> argparse.Namespace:
     # Snapshot
     parser.add_argument("--cross-vp", type=bool, default=True,
                         help="Enable cross visual prompt mode")
-    parser.add_argument("--save-interval", type=int, default=1,
+    parser.add_argument("--save-interval", type=int, default=30,
                         help="Interval for saving intermediate frames")
     # Batch processing
-    parser.add_argument("--batch-size", type=int, default=1,
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
     parser.add_argument("--vpe-momentum", type=float, default=0.9,
                         help="VPE moving average momentum")
-    parser.add_argument("--limit-frame", type=int, default=5,
+    parser.add_argument("--limit-frame", type=int, default=151,
                         help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -134,6 +169,15 @@ def parse_args() -> argparse.Namespace:
                         help="Reference img file path")
     parser.add_argument("--reference_label_path", type=str, default="videos/reference",
                         help="Reference label file path (JSON format)")
+    
+    # Confidence thresholds
+    parser.add_argument("--high-conf-thresh", type=float, default=0.3,
+                        help="High confidence threshold (default: 0.3)")
+    parser.add_argument("--medium-conf-thresh", type=float, default=0.1,
+                        help="Medium confidence threshold (default: 0.1)")
+    parser.add_argument("--very-low-conf-thresh", type=float, default=0.01,
+                        help="Very low confidence threshold (default: 0.01)")
+    
     return parser.parse_args()
 
 # ─────────────────────── Loader ────────────────────────────── #
@@ -352,7 +396,7 @@ def point_side(p, a, b) -> int:
 
 
 # ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
-def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
+def convert_results_to_objects(cpu_result, class_names, args=None) -> list[ObjectMeta]:
     """
     CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환
     Confidence 기준에 따른 클래스 할당:
@@ -374,32 +418,37 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
     # 🔍 Confidence 분포 디버깅 (처음 몇 프레임만)
     should_debug = _debug_frame_count < _max_debug_frames
     
-    if should_debug and len(confidences) > 0:
-        high_conf_count = np.sum(confidences >= 0.3)
-        medium_conf_count = np.sum((confidences >= 0.1) & (confidences < 0.3))
-        low_conf_count = np.sum((confidences >= 0.01) & (confidences < 0.1))
-        very_low_conf_count = np.sum(confidences < 0.01)
+    if len(confidences) > 0:
+        high_conf_count = np.sum(confidences >= args.high_conf_thresh)
+        medium_conf_count = np.sum((confidences >= args.medium_conf_thresh) & (confidences < args.high_conf_thresh))
+        low_conf_count = np.sum((confidences >= args.very_low_conf_thresh) & (confidences < args.medium_conf_thresh))
+        very_low_conf_count = np.sum(confidences < args.very_low_conf_thresh)
         
-        print(f"📊 프레임 {_debug_frame_count + 1} - Confidence 분포 (총 {len(confidences)}개):")
-        print(f"   - conf >= 0.3     : {high_conf_count}개 (VPE 업데이트용)")
-        print(f"   - 0.1 <= conf < 0.3: {medium_conf_count}개 (정상 클래스)")
-        print(f"   - 0.01 <= conf < 0.1: {low_conf_count}개 (→ 'object' 클래스)")
-        print(f"   - conf < 0.01     : {very_low_conf_count}개 (필터링됨)")
+        # 전역 통계 객체에 업데이트
+        global confidence_stats
+        confidence_stats.update(high_conf_count, medium_conf_count, low_conf_count, very_low_conf_count)
         
-        if len(confidences) > 0:
-            print(f"   - 최고 confidence: {np.max(confidences):.3f}")
-            print(f"   - 최저 confidence: {np.min(confidences):.3f}")
-            print(f"   - 평균 confidence: {np.mean(confidences):.3f}")
+        if should_debug:
+            print(f"📊 프레임 {_debug_frame_count + 1} - Confidence 분포 (총 {len(confidences)}개):")
+            print(f"   - conf >= {args.high_conf_thresh}     : {high_conf_count}개 (VPE 업데이트용)")
+            print(f"   - {args.medium_conf_thresh} <= conf < {args.high_conf_thresh}: {medium_conf_count}개 (정상 클래스)")
+            print(f"   - {args.very_low_conf_thresh} <= conf < {args.medium_conf_thresh}: {low_conf_count}개 (→ 'object' 클래스)")
+            print(f"   - conf < {args.very_low_conf_thresh}     : {very_low_conf_count}개 (필터링됨)")
+            
+            if len(confidences) > 0:
+                print(f"   - 최고 confidence: {np.max(confidences):.3f}")
+                print(f"   - 최저 confidence: {np.min(confidences):.3f}")
+                print(f"   - 평균 confidence: {np.mean(confidences):.3f}")
     
-    # confidence 0.01 미만 필터링
-    valid_mask = confidences >= 0.01
+    # confidence very_low_conf_thresh 미만 필터링
+    valid_mask = confidences >= args.very_low_conf_thresh
     boxes = boxes[valid_mask]
     confidences = confidences[valid_mask]
     class_ids = class_ids[valid_mask]
     
     if len(boxes) == 0:
         if should_debug:
-            print("⚠️ 0.01 이상의 confidence를 가진 객체가 없습니다!")
+            print(f"⚠️ {args.very_low_conf_thresh} 이상의 confidence를 가진 객체가 없습니다!")
         return objects
     
     # 마스크 정보 처리 (정교한 변환 로직 사용)
@@ -474,15 +523,15 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
         original_class_id = class_ids[i]
         
         # Confidence에 따른 클래스 할당
-        if conf >= 0.1:
+        if conf >= args.medium_conf_thresh:
             # 정상적인 클래스 부여
             final_class_id = original_class_id
             final_class_name = class_names[original_class_id] if original_class_id < len(class_names) else "unknown"
-            if conf >= 0.3:
+            if conf >= args.high_conf_thresh:
                 high_conf_assigned += 1
             else:
                 medium_conf_assigned += 1
-        else:  # 0.01 <= conf < 0.1
+        else:  # args.very_low_conf_thresh <= conf < args.medium_conf_thresh
             # 'object' 클래스로 부여
             final_class_id = object_class_id
             final_class_name = object_class_name
@@ -505,9 +554,9 @@ def convert_results_to_objects(cpu_result, class_names) -> list[ObjectMeta]:
     # 최종 할당 결과 출력 (디버깅 프레임에서만)
     if should_debug and len(objects) > 0:
         print(f"✅ 클래스 할당 완료:")
-        print(f"   - 고신뢰도 (≥0.3): {high_conf_assigned}개")
-        print(f"   - 중신뢰도 (0.1~0.3): {medium_conf_assigned}개") 
-        print(f"   - 저신뢰도 (0.01~0.1 → 'object'): {low_conf_assigned}개")
+        print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {high_conf_assigned}개")
+        print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {medium_conf_assigned}개") 
+        print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh} → 'object'): {low_conf_assigned}개")
         print(f"   - 총 할당된 객체: {len(objects)}개")
         print("-" * 50)
     
@@ -672,7 +721,7 @@ def draw_low_conf_label(image, box, track_id, class_name, confidence, color_pale
     
     return image
 
-def draw_objects_overlay(image, objects, color_palette):
+def draw_objects_overlay(image, objects, color_palette, args=None):
     """모든 개체의 overlay 그리기 (Supervision 방식: 큰 객체부터 작은 객체 순)
     추적된 모든 객체 표시 (정상 신뢰도 + 저신뢰도 객체 모두)
     """
@@ -683,9 +732,13 @@ def draw_objects_overlay(image, objects, color_palette):
     normal_objects = []
     low_conf_objects = []
     
+    # Default thresholds if args is not provided
+    very_low_thresh = args.very_low_conf_thresh if args else 0.01
+    medium_thresh = args.medium_conf_thresh if args else 0.1
+    
     for obj in objects:
         if (hasattr(obj, 'class_name') and obj.class_name == 'object' and 
-            0.01 <= obj.confidence < 0.1):
+            very_low_thresh <= obj.confidence < medium_thresh):
             low_conf_objects.append(obj)
         else:
             normal_objects.append(obj)
@@ -730,7 +783,7 @@ def draw_objects_overlay(image, objects, color_palette):
         
         # 저신뢰도 'object' 클래스는 특별 스타일로 그리기
         if (hasattr(obj, 'class_name') and obj.class_name == 'object' and 
-            0.01 <= obj.confidence < 0.1):
+            very_low_thresh <= obj.confidence < medium_thresh):
             # 저신뢰도 객체: 점선 박스와 특별 라벨
             image = draw_low_conf_box(image, obj.box, display_track_id, obj.class_id, color_palette)
             image = draw_low_conf_label(image, obj.box, display_track_id, obj.class_name, 
@@ -771,10 +824,10 @@ class InferenceThread(threading.Thread):
         print(f"   - Cross-VP 모드: {'활성화' if args.cross_vp else '비활성화'}")
         print(f"   - VPE 모멘텀: {args.vpe_momentum}")
         print(f"\n📊 Confidence 기준:")
-        print(f"   - conf >= 0.3  : VPE 업데이트 + 정상 클래스")
-        print(f"   - conf >= 0.1  : 정상 클래스 부여")
-        print(f"   - 0.01~0.1     : 'object' 클래스 + VPE 추가")
-        print(f"   - conf < 0.01  : 필터링 (사용하지 않음)")
+        print(f"   - conf >= {args.high_conf_thresh}  : VPE 업데이트 + 정상 클래스")
+        print(f"   - conf >= {args.medium_conf_thresh}  : 정상 클래스 부여")
+        print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 'object' 클래스 + VPE 추가")
+        print(f"   - conf < {args.very_low_conf_thresh}  : 필터링 (사용하지 않음)")
     
     def stop(self):
         """스레드 종료 요청"""
@@ -904,7 +957,7 @@ class InferenceThread(threading.Thread):
                 results = self.model_vp.predict(
                     source=batch_frames,
                     imgsz=self.args.image_size,
-                    conf=0.01,  # 0.01 이상의 모든 객체 포함
+                    conf=self.args.very_low_conf_thresh,  # very_low_conf_thresh 이상의 모든 객체 포함
                     iou=self.args.iou_thresh,
                     verbose=False
                 )
@@ -913,7 +966,7 @@ class InferenceThread(threading.Thread):
                 results = self.model_vp.predict(
                     source=batch_frames,
                     imgsz=self.args.image_size,
-                    conf=0.01,  # 0.01 이상의 모든 객체 포함
+                    conf=self.args.very_low_conf_thresh,  # very_low_conf_thresh 이상의 모든 객체 포함
                     iou=self.args.iou_thresh,
                     verbose=False
                 )
@@ -1001,11 +1054,11 @@ class InferenceThread(threading.Thread):
     
     def _update_batch_vpe(self, batch_results):
         """배치 결과에서 VPE 생성 (CPU 데이터 기반)
-        confidence >= 0.3인 detection만 VPE 업데이트에 사용
-        0.01 <= confidence < 0.1인 'object' 클래스도 embedding에 추가
+        confidence >= high_conf_thresh인 detection만 VPE 업데이트에 사용
+        very_low_conf_thresh <= confidence < medium_conf_thresh인 'object' 클래스도 embedding에 추가
         """
         high_conf_prompts = []
-        low_conf_object_prompts = []  # 0.01~0.1 confidence의 object 클래스용
+        low_conf_object_prompts = []  # very_low_conf_thresh~medium_conf_thresh confidence의 object 클래스용
         
         # Batch 내 모든 프레임에서 confidence별 detection 수집
         for i, cpu_result in enumerate(batch_results):
@@ -1014,8 +1067,8 @@ class InferenceThread(threading.Thread):
                 boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
                 class_ids = cpu_result['boxes_cls']  # 이미 CPU numpy array
                 
-                # 1. High confidence (>= 0.3): VPE 업데이트용
-                high_conf_mask = confidences >= 0.3
+                # 1. High confidence (>= high_conf_thresh): VPE 업데이트용
+                high_conf_mask = confidences >= self.args.high_conf_thresh
                 if np.any(high_conf_mask):
                     prompt_data = {
                         "bboxes": boxes[high_conf_mask],
@@ -1026,8 +1079,8 @@ class InferenceThread(threading.Thread):
                     }
                     high_conf_prompts.append(prompt_data)
                 
-                # 2. Low confidence (0.01~0.1): object 클래스로 embedding에 추가
-                low_conf_mask = (confidences >= 0.01) & (confidences < 0.1)
+                # 2. Low confidence (very_low_conf_thresh~medium_conf_thresh): object 클래스로 embedding에 추가
+                low_conf_mask = (confidences >= self.args.very_low_conf_thresh) & (confidences < self.args.medium_conf_thresh)
                 if np.any(low_conf_mask):
                     # 'object' 클래스 ID (마지막 클래스)
                     object_class_id = len(self.args.names) - 1
@@ -1524,7 +1577,7 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
         
         # ObjectMeta 변환 (CPU 데이터 기반)
-        detected_objects = convert_results_to_objects(cpu_result, args.names)
+        detected_objects = convert_results_to_objects(cpu_result, args.names, args)
         
         # 🔍 디버깅: 검출 객체 상황 확인 (처음 몇 프레임만)
         global _debug_frame_count, _max_debug_frames
@@ -1532,14 +1585,16 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             print(f"🎯 프레임 {frame_idx} - 검출 객체:")
             print(f"   - 전체 검출 객체: {len(detected_objects)}개")
             
-            # confidence별 분포 확인
-            high_conf = [obj for obj in detected_objects if obj.confidence >= 0.3]
-            medium_conf = [obj for obj in detected_objects if 0.1 <= obj.confidence < 0.3]
-            low_conf = [obj for obj in detected_objects if 0.01 <= obj.confidence < 0.1]
+            # confidence별 분포 확인 (count는 convert_results_to_objects에서 이미 처리됨)
+            high_conf = [obj for obj in detected_objects if obj.confidence >= args.high_conf_thresh]
+            medium_conf = [obj for obj in detected_objects if args.medium_conf_thresh <= obj.confidence < args.high_conf_thresh]
+            low_conf = [obj for obj in detected_objects if args.very_low_conf_thresh <= obj.confidence < args.medium_conf_thresh]
+            very_low_conf = [obj for obj in detected_objects if obj.confidence < args.very_low_conf_thresh]
             
-            print(f"   - 고신뢰도 (≥0.3): {len(high_conf)}개")
-            print(f"   - 중신뢰도 (0.1~0.3): {len(medium_conf)}개")
-            print(f"   - 저신뢰도 (0.01~0.1): {len(low_conf)}개")
+            print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {len(high_conf)}개")
+            print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {len(medium_conf)}개")
+            print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {len(low_conf)}개")
+            print(f"   - 초저신뢰도 (<{args.very_low_conf_thresh}): {len(very_low_conf)}개")
             
             if low_conf:
                 conf_list = [f"{obj.confidence:.3f}" for obj in low_conf]
@@ -1600,7 +1655,7 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         
         # 🎨 모든 객체들(추적된 객체 + 저신뢰도 객체)을 오버레이에 표시
         if all_objects_for_overlay:
-            annotated = draw_objects_overlay(annotated, all_objects_for_overlay, palette)
+            annotated = draw_objects_overlay(annotated, all_objects_for_overlay, palette, args)
 
         # Occupancy 업데이트
         raw_occupancy = int(np.sum(class_ids == person_class_id))
@@ -1752,6 +1807,9 @@ def main() -> None:
     HOLD_FR = getattr(args, 'hold', 10)
     drift_max = HOLD_FR  # 연속 검출 실패시 리셋
     drift_count = 0
+    
+    if "object" not in args.names:
+        args.names.append("object")
 
     # 입력 파일 이름에서 확장자를 제외한 기본 이름 추출
     base_name = os.path.splitext(os.path.basename(args.source))[0]
@@ -2198,6 +2256,10 @@ def main() -> None:
     print(f"   - 최종 occupancy: {current_occupancy}")
     print(f"   - 최종 congestion: {current_congestion}%")
     print(f"   - 라인 크로싱: forward {forward_cnt}, backward {backward_cnt}")
+    
+    # 전역 통계 객체를 사용해 최종 통계 출력
+    global confidence_stats
+    confidence_stats.print_stats(args)
     
     # if args.cross_vp and prev_vpe is not None:
     #     print(f"🧠 VPE 정보:")
