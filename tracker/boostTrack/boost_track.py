@@ -292,7 +292,7 @@ class BoostTrack(object):
         for obj in objects:
             if obj.confidence >= 0.1:
                 normal_objects.append(obj)
-            elif 0.01 <= obj.confidence < 0.1 and obj.class_name == 'object':
+            elif 0.01 <= obj.confidence < 0.1:
                 low_conf_objects.append(obj)
 
         # 정상 객체들을 numpy 배열로 변환

@@ -136,11 +136,13 @@ def parse_args() -> argparse.Namespace:
                         help="visual prompt confidence threshold")
     parser.add_argument("--iou-thresh", type=float, default=0.45,
                         help="Detection NMS IoU threshold")
+    parser.add_argument("--max-det", type=int, default=1000,
+                        help="Maximum number of detections per image")
     parser.add_argument("--track-history", type=int, default=100,
                         help="Frames kept in trajectory history")
     parser.add_argument("--track-det-thresh", type=float, default=0.2,
                         help="Detection confidence threshold for tracking")
-    parser.add_argument("--track-iou-thresh", type=float, default=0.3,
+    parser.add_argument("--track-iou-thresh", type=float, default=0.5,
                         help="Tracking IoU threshold")
     # Congestion / counting
     parser.add_argument("--max-people", type=int, default=100,
@@ -163,7 +165,7 @@ def parse_args() -> argparse.Namespace:
                         help="Number of threads for frame loading")
     parser.add_argument("--vpe-momentum", type=float, default=0.1,
                         help="VPE moving average momentum")
-    parser.add_argument("--limit-frame", type=int, default=1201,
+    parser.add_argument("--limit-frame", type=int, default=310,
                         help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -1164,9 +1166,7 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
             print(f"⚠️ 마스크 변환 오류: {e}")
             masks = None
     
-    # 저신뢰도 객체용 임시 클래스 정보 (실제 클래스 목록에는 포함되지 않음)
-    low_object_class_id = -1  # 특별한 ID로 구분
-    low_object_class_name = "low_object"
+    # 🎯 저신뢰도 객체는 원본 클래스 유지 (tracker가 confidence로 구분)
     
     # 🔍 클래스 할당 디버깅용 카운터
     high_conf_assigned = 0
@@ -1177,22 +1177,19 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
         conf = confidences[i]
         original_class_id = class_ids[i]
         
-        # Confidence에 따른 클래스 할당
-        if conf >= args.medium_conf_thresh:
-            # 정상적인 클래스 부여
-            final_class_id = original_class_id
-            final_class_name = class_names[original_class_id] if original_class_id < len(class_names) else "unknown"
-            if conf >= args.high_conf_thresh:
-                high_conf_assigned += 1
-            else:
-                medium_conf_assigned += 1
+        # 🎯 클래스는 항상 원본 클래스 유지 (tracker가 confidence로 구분)
+        final_class_id = original_class_id
+        final_class_name = class_names[original_class_id] if original_class_id < len(class_names) else "unknown"
+        
+        # Confidence 통계만 업데이트
+        if conf >= args.high_conf_thresh:
+            high_conf_assigned += 1
+        elif conf >= args.medium_conf_thresh:
+            medium_conf_assigned += 1
         else:  # args.very_low_conf_thresh <= conf < args.medium_conf_thresh
-            # 임시 'low_object' 클래스로 부여 (tracker 연결 목적)
-            final_class_id = low_object_class_id
-            final_class_name = low_object_class_name
             low_conf_assigned += 1
             if should_debug:
-                print(f"🎯 저신뢰도 객체 발견! conf={conf:.3f}, 원본클래스={class_names[original_class_id] if original_class_id < len(class_names) else 'unknown'} → 'low_object'로 임시 할당 (tracker용)")
+                print(f"🎯 저신뢰도 객체 발견! conf={conf:.3f}, 클래스={final_class_name} (원본 클래스 유지, tracker가 confidence로 구분)")
         
         obj = ObjectMeta(
             box=boxes[i],
@@ -1208,10 +1205,10 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
     
             # 최종 할당 결과 출력 (디버깅 프레임에서만)
         if should_debug and len(objects) > 0:
-            print(f"✅ 클래스 할당 완료:")
+            print(f"✅ 클래스 할당 완료 (원본 클래스 유지):")
             print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {high_conf_assigned}개")
             print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {medium_conf_assigned}개") 
-            print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh} → 'low_object'): {low_conf_assigned}개")
+            print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {low_conf_assigned}개 (원본 클래스 유지)")
             print(f"   - 총 할당된 객체: {len(objects)}개")
             print("-" * 50)
     
@@ -1375,8 +1372,13 @@ def draw_low_conf_label(image, box, track_id, class_name, confidence, color_pale
     safe_track_id = abs(track_id) if track_id < 0 else track_id
     color = color_palette.by_idx(safe_track_id).as_bgr()
     
-    # 라벨 텍스트 (저신뢰도 표시 추가)
-    label = f"[LOW] {class_name} {confidence:.3f}"
+    # 🎯 라벨 텍스트 (저신뢰도 표시 + track ID 포함)
+    if track_id is not None and track_id >= 0:
+        # track ID가 부여된 경우: [LOW] 클래스명 ID confidence
+        label = f"[LOW] {class_name} {track_id} {confidence:.3f}"
+    else:
+        # track ID가 없는 경우: [LOW] 클래스명 confidence
+        label = f"[LOW] {class_name} {confidence:.3f}"
     
     
     # 텍스트 크기 계산
@@ -1410,7 +1412,7 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
     if not objects:
         return image
     
-    # 객체 타입별 분리 (저신뢰도 'object' 클래스 구분)
+    # 객체 타입별 분리 (confidence 기준으로 저신뢰도 구분)
     normal_objects = []
     low_conf_objects = []
     
@@ -1419,8 +1421,8 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
     medium_thresh = args.medium_conf_thresh if args else 0.1
     
     for obj in objects:
-        if (hasattr(obj, 'class_name') and obj.class_name == 'low_object' and 
-            very_low_thresh <= obj.confidence < medium_thresh):
+        # 🎯 confidence 기준으로만 저신뢰도 구분 (클래스는 원본 유지)
+        if very_low_thresh <= obj.confidence < medium_thresh:
             low_conf_objects.append(obj)
         else:
             normal_objects.append(obj)
@@ -1435,8 +1437,10 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
         if low_conf_objects:
             conf_values = [f"{obj.confidence:.3f}" for obj in low_conf_objects]
             track_ids = [f"{obj.track_id}" for obj in low_conf_objects]
-            print(f"   - 저신뢰도 low_object confidence: {', '.join(conf_values)}")
-            print(f"   - 저신뢰도 low_object track_ids: {', '.join(track_ids)}")
+            class_names = [obj.class_name for obj in low_conf_objects]
+            print(f"   - 저신뢰도 객체 confidence: {', '.join(conf_values)}")
+            print(f"   - 저신뢰도 객체 클래스: {', '.join(class_names)}")
+            print(f"   - 저신뢰도 객체 track_ids: {', '.join(track_ids)}")
     
     all_display_objects = normal_objects + low_conf_objects
     
@@ -1463,10 +1467,9 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
     for obj in all_display_objects:
         display_track_id = obj.track_id if obj.track_id is not None else -999
         
-        # 저신뢰도 'low_object' 클래스는 특별 스타일로 그리기
-        if (hasattr(obj, 'class_name') and obj.class_name == 'low_object' and 
-            very_low_thresh <= obj.confidence < medium_thresh):
-            # 저신뢰도 객체: 점선 박스와 특별 라벨
+        # 🎯 confidence 기준으로 저신뢰도 객체 특별 스타일 적용
+        if very_low_thresh <= obj.confidence < medium_thresh:
+            # 저신뢰도 객체: 점선 박스와 특별 라벨 (원본 클래스 유지)
             image = draw_low_conf_box(image, obj.box, display_track_id, obj.class_id, color_palette)
             image = draw_low_conf_label(image, obj.box, display_track_id, obj.class_name, 
                                       obj.confidence, color_palette)
@@ -1513,7 +1516,7 @@ class InferenceThread(threading.Thread):
         print(f"   - VPE 모멘텀: {args.vpe_momentum}")
         print(f"\n📊 Confidence 기준:")
         print(f"   - conf >= {args.medium_conf_thresh}  : 정상 클래스 + 로깅 (≥0.1)")
-        print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 'low_object' (tracker 연결용)")
+        print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 저신뢰도 (원본 클래스 유지, tracker가 confidence로 구분)")
         print(f"   - conf >= {args.very_low_conf_thresh}  : 모두 VPE 업데이트 사용 (≥0.01)")
         print(f"   - conf < {args.very_low_conf_thresh}  : 필터링 (사용하지 않음)")
         print(f"   - 기본 감지 영역: {'설정됨' if detection_area_polygon else '미설정'}")
@@ -2318,19 +2321,20 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
             class_ids = np.empty(0, int)
             track_ids = np.empty(0, int)
 
-        # 로깅 처리 (low_object는 제외)
+        # 🎯 로깅 처리 (모든 클래스 포함, confidence >= medium_thresh인 객체만 로깅)
         if log_file is not None:
             class_counts = defaultdict(int)
-            valid_objects = [obj for obj in tracked_objects if obj.class_name != 'low_object']
+            # medium_thresh 이상의 객체만 로깅 (저신뢰도 객체는 로깅에서 제외)
+            valid_objects = [obj for obj in tracked_objects if obj.confidence >= args.medium_conf_thresh]
             valid_class_ids = [obj.class_id for obj in valid_objects]
             valid_track_ids = [obj.track_id for obj in valid_objects]
             
             for cid in valid_class_ids:
-                if cid >= 0:  # low_object의 class_id는 -1이므로 제외
+                if cid >= 0:  # 유효한 클래스 ID만
                     class_counts[cid] += 1
 
             for obj in valid_objects:
-                if obj.class_id >= 0:  # low_object 제외
+                if obj.class_id >= 0:  # 유효한 클래스 ID만
                     class_name = obj.class_name
                     class_count = class_counts[obj.class_id]
                     log_entry = f"{time_str},{class_name},{obj.track_id},{class_count}\n"
@@ -2737,6 +2741,11 @@ def main() -> None:
     model_vp = YOLOE(args.checkpoint)
     model_vp.eval()
     model_vp.to(args.device)
+    
+    # max_det 설정 (있을 경우)
+    if hasattr(args, 'max_det') and args.max_det is not None:
+        model_vp.model.model[-1].max_det = args.max_det
+        print(f"📊 모델 max_det 설정: {args.max_det}")
     
     # 🧠 VP & TP Embedding 추출
     final_vpe = None
