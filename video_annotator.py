@@ -72,6 +72,12 @@ class ConfidenceStats:
 
 # 전역 통계 객체
 confidence_stats = ConfidenceStats()
+# ─────────────────────── ROI (Region of Interest) Utilities ────────────────────────────── #
+import json
+from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
+import ast
+
 
 # ────────────────────────────── ObjectMeta Class ──────────────────────────── #
 class ObjectMeta:
@@ -97,9 +103,9 @@ class ObjectMeta:
 # ANCHOR argparse
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    # I/O
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    # parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    # NOTE [args] source & output
+    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="../10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -110,10 +116,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str,
                         default="pretrain/yoloe-11l-seg.pt",
                         help="YOLOE checkpoint (detection + seg)")
+    # NOTE [args] text prompt
     parser.add_argument("--names", nargs="+",
                         # default=["fish", "disco ball", "object"],
                         default=["pig", "disco ball", "object"],
                         help="Custom class names list (index order matters)")
+    # NOTE [args] GPU Device
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Inference device")
     # Inference / tracking
@@ -127,13 +135,13 @@ def parse_args() -> argparse.Namespace:
                         help="Detection NMS IoU threshold")
     parser.add_argument("--track-history", type=int, default=100,
                         help="Frames kept in trajectory history")
-    parser.add_argument("--track-det-thresh", type=float, default=0.1,
+    parser.add_argument("--track-det-thresh", type=float, default=0.2,
                         help="Detection confidence threshold for tracking")
     parser.add_argument("--track-iou-thresh", type=float, default=0.3,
                         help="Tracking IoU threshold")
     # Congestion / counting
     parser.add_argument("--max-people", type=int, default=100,
-                        help="People count that corresponds to 100 % congestion")
+                        help="People count that corresponds to 100 percent congestion")
     parser.add_argument("--line-start", nargs=2, type=float,
                         default=None,
                         help="Counting line start (norm. x y, 0~1)")
@@ -145,7 +153,7 @@ def parse_args() -> argparse.Namespace:
                         help="Enable cross visual prompt mode")
     parser.add_argument("--save-interval", type=int, default=30,
                         help="Interval for saving intermediate frames")
-    # Batch processing
+    # NOTE [args] Batch processing
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
@@ -178,6 +186,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--very-low-conf-thresh", type=float, default=0.01,
                         help="Very low confidence threshold (default: 0.01)")
     
+    # NOTE [args] ROI Access Detection
+    parser.add_argument("--roi-zones", type=str, 
+                        # default=None,
+                        default="[[214,392,286,392,290,478,214,478],[864,387,945,383,947,465,869,468],[478,14,735,7,736,225,491,221]]",
+                        help="ROI zones as nested list of pixel coordinates")
+    parser.add_argument("--roi-names", type=str, 
+                        # default=None,
+                        default="water_area1,water_area2,feeding_area",
+                        help="ROI zone names separated by comma")
+    parser.add_argument("--roi-detection-method", choices=['bbox', 'mask', 'hybrid'], 
+                        default='bbox', help="ROI detection method: bbox overlap, mask overlap, or hybrid")
+    parser.add_argument("--roi-dwell-time", type=float, default=1.0,
+                        help="Minimum dwell time in seconds for ROI access detection")
+    parser.add_argument("--roi-bbox-threshold", type=float, default=0.1,
+                        help="Minimum bbox overlap ratio for ROI detection")
+    parser.add_argument("--roi-mask-threshold", type=float, default=0.1,
+                        help="Minimum mask overlap ratio for ROI detection")
+    parser.add_argument("--roi-exit-grace-time", type=float, default=2.0,
+                        help="Grace time in seconds before removing objects that left ROI")
+    # NOTE [args] Detection area
+    parser.add_argument("--detection-area", type=str, 
+                        default="192,0,951,0,997,356,938,719,232,719,153,348",
+                        help="Basic detection area as polygon coordinates (e.g., '100,100,500,100,500,400,100,400')")
+    # Output resolution
+    parser.add_argument("--output-width", type=int, default=1920,
+                        help="Output video width (if not set, uses input width)")
+    parser.add_argument("--output-height", type=int, default=1080,
+                        help="Output video height (if not set, uses input height)")
     return parser.parse_args()
 
 # ─────────────────────── Loader ────────────────────────────── #
@@ -395,8 +431,623 @@ def point_side(p, a, b) -> int:
     return 0 if val == 0 else (1 if val > 0 else -1)
 
 
+def parse_roi_zones(roi_zones_str):
+    """ROI zones 문자열을 파싱하여 polygon 리스트로 변환"""
+    if not roi_zones_str:
+        return []
+    
+    try:
+        # 문자열을 리스트로 파싱
+        zones_data = ast.literal_eval(roi_zones_str)
+        
+        polygons = []
+        for zone_coords in zones_data:
+            if len(zone_coords) < 6 or len(zone_coords) % 2 != 0:
+                print(f"⚠️ ROI zone 좌표가 잘못됨: {zone_coords} (최소 3개 점 필요)")
+                continue
+            
+            # [x1,y1,x2,y2,x3,y3,...] → [(x1,y1), (x2,y2), (x3,y3), ...]
+            points = [(zone_coords[i], zone_coords[i+1]) for i in range(0, len(zone_coords), 2)]
+            
+            try:
+                polygon = Polygon(points)
+                if polygon.is_valid:
+                    polygons.append(polygon)
+                else:
+                    print(f"⚠️ 유효하지 않은 polygon: {points}")
+            except Exception as e:
+                print(f"⚠️ Polygon 생성 실패: {points}, 오류: {e}")
+        
+        return polygons
+    
+    except Exception as e:
+        print(f"💥 ROI zones 파싱 오류: {e}")
+        return []
+
+def parse_roi_names(roi_names_str, num_zones):
+    """ROI names 문자열을 파싱하여 이름 리스트로 변환"""
+    if not roi_names_str:
+        # 이름이 없으면 자동으로 Zone_0, Zone_1, ... 생성
+        return [f"Zone_{i}" for i in range(num_zones)]
+    
+    names = [name.strip() for name in roi_names_str.split(',')]
+    
+    # 이름 개수가 부족하면 자동 생성으로 채움
+    while len(names) < num_zones:
+        names.append(f"Zone_{len(names)}")
+    
+    return names[:num_zones]  # 초과하는 이름은 제거
+
+def parse_detection_area(detection_area_str):
+    """기본 감지 영역 문자열을 파싱하여 polygon으로 변환"""
+    if not detection_area_str:
+        return None
+    
+    try:
+        # 문자열을 숫자 리스트로 파싱
+        coords = [float(x.strip()) for x in detection_area_str.split(',')]
+        
+        if len(coords) < 6 or len(coords) % 2 != 0:
+            print(f"⚠️ 기본 감지 영역 좌표가 잘못됨: {coords} (최소 3개 점 필요)")
+            return None
+        
+        # [x1,y1,x2,y2,x3,y3,...] → [(x1,y1), (x2,y2), (x3,y3), ...]
+        points = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+        
+        try:
+            polygon = Polygon(points)
+            if polygon.is_valid:
+                print(f"✅ 기본 감지 영역 설정 완료: {len(points)}개 점")
+                return polygon
+            else:
+                print(f"⚠️ 유효하지 않은 기본 감지 영역: {points}")
+                return None
+        except Exception as e:
+            print(f"⚠️ 기본 감지 영역 Polygon 생성 실패: {points}, 오류: {e}")
+            return None
+    
+    except Exception as e:
+        print(f"💥 기본 감지 영역 파싱 오류: {e}")
+        return None
+
+def calculate_bbox_polygon_overlap(bbox, polygon):
+    """bbox와 polygon의 겹침 비율 계산"""
+    try:
+        x1, y1, x2, y2 = bbox
+        bbox_polygon = box(x1, y1, x2, y2)
+        
+        if not bbox_polygon.is_valid or not polygon.is_valid:
+            return 0.0
+        
+        intersection = bbox_polygon.intersection(polygon)
+        if intersection.is_empty:
+            return 0.0
+        
+        bbox_area = bbox_polygon.area
+        if bbox_area == 0:
+            return 0.0
+        
+        overlap_ratio = intersection.area / bbox_area
+        return overlap_ratio
+    
+    except Exception as e:
+        print(f"⚠️ bbox-polygon 겹침 계산 오류: {e}")
+        return 0.0
+
+def calculate_mask_polygon_overlap(mask, polygon, image_shape):
+    """mask와 polygon의 겹침 비율 계산"""
+    try:
+        if mask is None:
+            return 0.0
+        
+        height, width = image_shape[:2]
+        
+        # mask를 이미지 크기에 맞게 조정
+        if mask.shape[:2] != (height, width):
+            mask = cv2.resize(mask.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+        
+        # mask를 boolean으로 변환
+        mask_bool = mask > 0.5
+        
+        # polygon을 mask로 변환
+        polygon_coords = np.array(polygon.exterior.coords, dtype=np.int32)
+        polygon_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(polygon_mask, [polygon_coords], 1)
+        polygon_bool = polygon_mask.astype(bool)
+        
+        # 교집합 계산
+        intersection = np.logical_and(mask_bool, polygon_bool)
+        intersection_area = np.sum(intersection)
+        
+        # mask 전체 면적
+        mask_area = np.sum(mask_bool)
+        if mask_area == 0:
+            return 0.0
+        
+        overlap_ratio = intersection_area / mask_area
+        return overlap_ratio
+    
+    except Exception as e:
+        print(f"⚠️ mask-polygon 겹침 계산 오류: {e}")
+        return 0.0
+
+# NOTE Check ROI Access
+def check_roi_access(obj, polygon, method, bbox_threshold, mask_threshold, image_shape):
+    """객체가 ROI에 접근했는지 확인"""
+    if method == 'bbox':
+        overlap_ratio = calculate_bbox_polygon_overlap(obj.box, polygon)
+        return overlap_ratio >= bbox_threshold
+    
+    elif method == 'mask':
+        if obj.mask is None:
+            # mask가 없으면 bbox로 fallback
+            overlap_ratio = calculate_bbox_polygon_overlap(obj.box, polygon)
+            return overlap_ratio >= bbox_threshold
+        else:
+            overlap_ratio = calculate_mask_polygon_overlap(obj.mask, polygon, image_shape)
+            return overlap_ratio >= mask_threshold
+    
+    elif method == 'hybrid':
+        # 1단계: bbox 빠른 필터링
+        bbox_overlap = calculate_bbox_polygon_overlap(obj.box, polygon)
+        if bbox_overlap < bbox_threshold:
+            return False
+        
+        # 2단계: mask 정밀 검사 (bbox 겹침이 있을 때만)
+        if obj.mask is not None:
+            mask_overlap = calculate_mask_polygon_overlap(obj.mask, polygon, image_shape)
+            return mask_overlap >= mask_threshold
+        else:
+            # mask가 없으면 bbox 결과 사용
+            return True
+    
+    return False
+
+def is_bbox_center_in_polygon(bbox, polygon):
+    """bbox의 center가 polygon 내부에 있는지 확인"""
+    try:
+        x1, y1, x2, y2 = bbox
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        
+        from shapely.geometry import Point
+        center_point = Point(center_x, center_y)
+        
+        return polygon.contains(center_point)
+    
+    except Exception as e:
+        print(f"⚠️ Bbox center in polygon 검사 오류: {e}")
+        return True  # 오류시 기본적으로 포함된 것으로 처리
+
+
+# ─────────────────────── ROI Access Manager Class ────────────────────────────── #
+class ROIAccessManager:
+    """ROI 접근 감지 및 통계 관리 클래스"""
+    
+    def __init__(self, roi_polygons, roi_names, detection_method, dwell_time, 
+                 bbox_threshold, mask_threshold, fps, exit_grace_time):
+        self.roi_polygons = roi_polygons
+        self.roi_names = roi_names
+        self.detection_method = detection_method
+        self.dwell_time = dwell_time
+        self.bbox_threshold = bbox_threshold
+        self.mask_threshold = mask_threshold
+        self.fps = fps
+        self.exit_grace_time = exit_grace_time
+        
+        # 접근에 필요한 프레임 수 계산
+        self.required_frames = int(dwell_time * fps)
+        # 퇴장 유예 프레임 수 계산
+        self.exit_grace_frames = int(exit_grace_time * fps)
+        
+        # 각 ROI별 통계
+        self.roi_stats = {}
+        for i, name in enumerate(roi_names):
+            self.roi_stats[name] = {
+                'total_access': 0,
+                'accessed_labels': set(),
+                'track_access_count': {},  # {track_id: access_count}
+                'current_tracks': {},  # {track_id: {'enter_frame': frame, 'label': label, 'consecutive_frames': count}}
+                'exit_pending_tracks': {}  # {track_id: {'exit_frame': frame, 'grace_frames_left': count}}
+            }
+        
+        print(f"\n🎯 ROI Access Manager 초기화:")
+        print(f"   - ROI 개수: {len(roi_polygons)}")
+        print(f"   - ROI 이름: {roi_names}")
+        print(f"   - 감지 방법: {detection_method}")
+        print(f"   - 체류 시간: {dwell_time}초 ({self.required_frames} 프레임)")
+        print(f"   - 퇴장 유예 시간: {exit_grace_time}초 ({self.exit_grace_frames} 프레임)")
+        print(f"   - bbox 임계값: {bbox_threshold}")
+        print(f"   - mask 임계값: {mask_threshold}")
+    
+    def update(self, tracked_objects, frame_idx, image_shape):
+        """매 프레임마다 ROI 접근 상태 업데이트"""
+        current_frame_tracks = set()
+        
+        for roi_idx, (polygon, roi_name) in enumerate(zip(self.roi_polygons, self.roi_names)):
+            roi_stat = self.roi_stats[roi_name]
+            current_roi_tracks = set()
+            
+            # 현재 프레임에서 이 ROI에 있는 객체들 확인
+            for obj in tracked_objects:
+                if obj.track_id is None or obj.track_id == -1:
+                    continue
+                
+                # ROI 접근 확인
+                is_in_roi = check_roi_access(
+                    obj, polygon, self.detection_method,
+                    self.bbox_threshold, self.mask_threshold, image_shape
+                )
+                
+                if is_in_roi:
+                    current_roi_tracks.add(obj.track_id)
+                    current_frame_tracks.add(obj.track_id)
+                    
+                    if obj.track_id in roi_stat['current_tracks']:
+                        # 이미 ROI에 있던 객체 → 연속 프레임 수 증가
+                        roi_stat['current_tracks'][obj.track_id]['consecutive_frames'] += 1
+                        
+                        # 체류 시간 조건 만족 시 접근으로 카운트
+                        if (roi_stat['current_tracks'][obj.track_id]['consecutive_frames'] >= self.required_frames and
+                            not roi_stat['current_tracks'][obj.track_id].get('counted', False)):
+                            
+                            # 접근 카운트 증가
+                            roi_stat['total_access'] += 1
+                            roi_stat['accessed_labels'].add(obj.class_name)
+                            
+                            if obj.track_id not in roi_stat['track_access_count']:
+                                roi_stat['track_access_count'][obj.track_id] = 0
+                            roi_stat['track_access_count'][obj.track_id] += 1
+                            
+                            # 중복 카운트 방지
+                            roi_stat['current_tracks'][obj.track_id]['counted'] = True
+                            
+                            # print(f"🎯 ROI 접근 감지: {roi_name} - track_id:{obj.track_id} ({obj.class_name})")
+                    
+                    else:
+                        # 새로 ROI에 진입한 객체
+                        roi_stat['current_tracks'][obj.track_id] = {
+                            'enter_frame': frame_idx,
+                            'label': obj.class_name,
+                            'consecutive_frames': 1,
+                            'counted': False
+                        }
+            
+            # ROI에서 나간 객체들 처리 (유예 시간 적용)
+            tracks_to_remove = []
+            tracks_to_exit_pending = []
+            
+            # 1. 현재 ROI에 없는 객체들 확인
+            for track_id in roi_stat['current_tracks']:
+                if track_id not in current_roi_tracks:
+                    # 🎯 ROI에서 나간 객체 → counted=True인 객체만 퇴장 대기 상태로 이동
+                    if track_id not in roi_stat['exit_pending_tracks']:
+                        track_info = roi_stat['current_tracks'][track_id]
+                        if track_info.get('counted', False):
+                            # 접근이 확인된 객체만 퇴장 대기로 이동
+                            tracks_to_exit_pending.append(track_id)
+                        else:
+                            # 접근 미확인 객체는 바로 제거
+                            tracks_to_remove.append(track_id)
+            
+            # 2. 퇴장 대기 상태로 이동
+            for track_id in tracks_to_exit_pending:
+                roi_stat['exit_pending_tracks'][track_id] = {
+                    'exit_frame': frame_idx,
+                    'grace_frames_left': self.exit_grace_frames
+                }
+                # current_tracks에서는 아직 제거하지 않음 (유예 기간 동안 유지)
+            
+            # 3. 퇴장 대기 중인 객체들의 유예 시간 감소
+            exit_pending_to_remove = []
+            for track_id in list(roi_stat['exit_pending_tracks'].keys()):
+                if track_id in current_roi_tracks:
+                    # 다시 ROI에 들어온 경우 → 퇴장 대기 취소
+                    del roi_stat['exit_pending_tracks'][track_id]
+                    # print(f"🔄 ROI 재진입: {roi_name} - track_id:{track_id}")
+                else:
+                    # 여전히 ROI 밖에 있는 경우 → 유예 시간 감소
+                    roi_stat['exit_pending_tracks'][track_id]['grace_frames_left'] -= 1
+                    
+                    if roi_stat['exit_pending_tracks'][track_id]['grace_frames_left'] <= 0:
+                        # 유예 시간 만료 → 완전 제거
+                        exit_pending_to_remove.append(track_id)
+                        tracks_to_remove.append(track_id)
+            
+            # 4. 유예 시간이 만료된 객체들 완전 제거
+            for track_id in exit_pending_to_remove:
+                del roi_stat['exit_pending_tracks'][track_id]
+            
+            for track_id in tracks_to_remove:
+                if track_id in roi_stat['current_tracks']:
+                    del roi_stat['current_tracks'][track_id]
+                    # print(f"🚪 ROI 완전 퇴장: {roi_name} - track_id:{track_id} (유예 시간 만료)")
+    
+    def get_current_roi_tracks(self):
+        """현재 각 ROI에 있는 track_id들 반환 (퇴장 대기 중인 객체 포함)"""
+        current_tracks = {}
+        for roi_name, roi_stat in self.roi_stats.items():
+            # 현재 ROI에 있는 객체들 + 퇴장 대기 중인 객체들 (유예 기간 동안은 여전히 ROI에 있는 것으로 간주)
+            active_tracks = set(roi_stat['current_tracks'].keys())
+            # 퇴장 대기 중인 객체들도 포함 (시각화 목적)
+            pending_tracks = set(roi_stat['exit_pending_tracks'].keys())
+            all_tracks = active_tracks.union(pending_tracks)
+            current_tracks[roi_name] = list(all_tracks)
+        return current_tracks
+    
+    def get_roi_tracks_by_status(self):
+        """🎯 ROI 상태별 track_id들을 반환 (3단계 구분)"""
+        roi_tracks_status = {}
+        
+        for roi_name, roi_stat in self.roi_stats.items():
+            # 각 ROI별로 상태별 track_id 분류
+            pending_access = []    # 접근 확인 대기
+            confirmed_access = []  # 접근 확인
+            exit_pending = []      # 퇴장 대기
+            
+            # 1. current_tracks에서 접근 확인 대기 vs 접근 확인 구분
+            for track_id, track_info in roi_stat['current_tracks'].items():
+                if track_info.get('counted', False):
+                    # 접근이 확인된 상태
+                    confirmed_access.append(track_id)
+                else:
+                    # 아직 접근 확인 대기 상태
+                    pending_access.append(track_id)
+            
+            # 2. exit_pending_tracks는 모두 퇴장 대기 상태
+            exit_pending = list(roi_stat['exit_pending_tracks'].keys())
+            
+            roi_tracks_status[roi_name] = {
+                'pending_access': pending_access,      # 빨간색 점선
+                'confirmed_access': confirmed_access,  # 빨간색 실선
+                'exit_pending': exit_pending          # 빨간색 점선
+            }
+        
+        return roi_tracks_status
+    
+    def get_statistics(self):
+        """최종 통계 반환"""
+        stats = {}
+        for roi_name, roi_stat in self.roi_stats.items():
+            stats[roi_name] = {
+                'total_access': roi_stat['total_access'],
+                'accessed_labels': list(roi_stat['accessed_labels']),
+                'track_access_count': dict(roi_stat['track_access_count'])
+            }
+        return stats
+    
+    def save_statistics(self, output_path):
+        """통계를 JSON 파일로 저장"""
+        stats = self.get_statistics()
+        
+        # 추가 메타데이터
+        metadata = {
+            'roi_detection_method': self.detection_method,
+            'dwell_time_seconds': self.dwell_time,
+            'required_frames': self.required_frames,
+            'exit_grace_time_seconds': self.exit_grace_time,
+            'exit_grace_frames': self.exit_grace_frames,
+            'bbox_threshold': self.bbox_threshold,
+            'mask_threshold': self.mask_threshold,
+            'roi_names': self.roi_names
+        }
+        
+        result = {
+            'metadata': metadata,
+            'roi_statistics': stats
+        }
+        
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"📊 ROI 통계 저장 완료: {output_path}")
+        except Exception as e:
+            print(f"💥 ROI 통계 저장 실패: {e}")
+    
+    def print_final_statistics(self):
+        """최종 통계를 콘솔에 출력"""
+        print(f"\n🎯 ROI 접근 감지 최종 통계:")
+        print(f"{'='*50}")
+        
+        for roi_name, roi_stat in self.roi_stats.items():
+            print(f"\n📍 {roi_name}: {roi_stat['total_access']}회 접근")
+            
+            if roi_stat['accessed_labels']:
+                print(f"   접근한 클래스: {', '.join(sorted(roi_stat['accessed_labels']))}")
+            
+            if roi_stat['track_access_count']:
+                print(f"   Track ID별 접근 횟수:")
+                for track_id, count in sorted(roi_stat['track_access_count'].items()):
+                    print(f"     - Track {track_id}: {count}회")
+            
+            if not roi_stat['total_access']:
+                print(f"   접근 기록 없음")
+        
+        print(f"{'='*50}")
+
+
+# ─────────────────────── ROI Visualization Functions ────────────────────────────── #
+# NOTE Draw ROI polygons
+def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
+    """ROI polygon들을 이미지에 그리기 (반투명 색칠 포함)"""
+    
+    # 반투명 내부 채우기를 위한 복사본 생성
+    overlay = image.copy()
+    color = (255, 228, 0)
+    
+    for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
+        try:
+            # polygon 좌표 추출
+            coords = np.array(polygon.exterior.coords, dtype=np.int32)
+            
+            # 색상 선택
+            
+            # 1. polygon 내부를 색으로 채우기 (overlay에만 - 나중에 투명도 적용)
+            cv2.fillPoly(overlay, [coords], color)
+        
+        except Exception as e:
+            print(f"⚠️ ROI polygon 그리기 오류: {e}")
+    
+    # 2. 반투명 내부 채우기 블렌딩 (투명도 30%)
+    alpha = 0.4
+    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    
+    # 3. 테두리 그리기 (투명도 없이 원본 image에 직접)
+    for i, (polygon, roi_name) in enumerate(zip(roi_polygons, roi_names)):
+        try:
+            coords = np.array(polygon.exterior.coords, dtype=np.int32)
+            cv2.polylines(image, [coords], isClosed=True, color=color, thickness=8)
+            
+            # ROI 이름과 접근 횟수 표시
+            if roi_name in roi_stats:
+                total_access = roi_stats[roi_name]['total_access']
+                
+                # polygon의 중심점 계산
+                centroid = polygon.centroid
+                text_x, text_y = int(centroid.x), int(centroid.y)
+                
+                # 텍스트 배경
+                text = f"{roi_name}: {total_access}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                thickness = 2
+                (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                
+                # 배경 사각형 (원본 image에 직접)
+                cv2.rectangle(image, (text_x - 5, text_y - text_h - 10), 
+                             (text_x + text_w + 5, text_y + 5), color, -1)
+                
+                # 텍스트 (원본 image에 직접)
+                cv2.putText(image, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)            
+        except Exception as e:
+            print(f"⚠️ ROI polygon 테두리 그리기 오류: {e}")
+    
+    return image
+
+def highlight_roi_objects(image, tracked_objects, roi_tracks_status, color_palette):
+    """🎯 ROI 상태별로 객체들을 하이라이트 (3단계 구분)"""
+    
+    # 모든 ROI의 상태별 track_id들 수집
+    confirmed_track_ids = set()  # 접근 확인 (빨간색 실선)
+    pending_track_ids = set()    # 접근 확인 대기 + 퇴장 대기 (빨간색 점선)
+    
+    for roi_name, status_dict in roi_tracks_status.items():
+        confirmed_track_ids.update(status_dict['confirmed_access'])
+        pending_track_ids.update(status_dict['pending_access'])
+        pending_track_ids.update(status_dict['exit_pending'])
+    
+    # 빨간색 정의
+    red_color = (255, 0, 0)  # BGR 형식
+    thickness = 4
+    
+    for obj in tracked_objects:
+        if obj.track_id in confirmed_track_ids:
+            # 접근 확인된 객체 → 빨간색 실선 테두리
+            x1, y1, x2, y2 = map(int, obj.box)
+            cv2.rectangle(image, (x1-2, y1-2), (x2+2, y2+2), red_color, thickness)
+            
+        elif obj.track_id in pending_track_ids:
+            # 접근 확인 대기 또는 퇴장 대기 객체 → 빨간색 점선 테두리
+            x1, y1, x2, y2 = map(int, obj.box)
+            draw_dashed_rectangle(image, (x1-2, y1-2), (x2+2, y2+2), red_color, thickness)
+    
+    return image
+
+def draw_dashed_rectangle(image, pt1, pt2, color, thickness, dash_length=10):
+    """🎨 점선으로 사각형 그리기"""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    # 4개 변을 각각 점선으로 그리기
+    # 상단 변
+    draw_dashed_line(image, (x1, y1), (x2, y1), color, thickness, dash_length)
+    # 하단 변  
+    draw_dashed_line(image, (x1, y2), (x2, y2), color, thickness, dash_length)
+    # 좌측 변
+    draw_dashed_line(image, (x1, y1), (x1, y2), color, thickness, dash_length)
+    # 우측 변
+    draw_dashed_line(image, (x2, y1), (x2, y2), color, thickness, dash_length)
+
+def draw_dashed_line(image, pt1, pt2, color, thickness, dash_length=10):
+    """🎨 점선 그리기"""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    # 선분의 총 길이 계산
+    total_length = int(np.sqrt((x2 - x1)**2 + (y2 - y1)**2))
+    
+    if total_length == 0:
+        return
+    
+    # 단위 벡터 계산
+    dx = (x2 - x1) / total_length
+    dy = (y2 - y1) / total_length
+    
+    # 점선 그리기
+    current_length = 0
+    while current_length < total_length:
+        # 현재 점 계산
+        start_x = int(x1 + dx * current_length)
+        start_y = int(y1 + dy * current_length)
+        
+        # 다음 점 계산 (dash_length만큼 이동)
+        end_length = min(current_length + dash_length, total_length)
+        end_x = int(x1 + dx * end_length)
+        end_y = int(y1 + dy * end_length)
+        
+        # 실선 구간 그리기
+        cv2.line(image, (start_x, start_y), (end_x, end_y), color, thickness)
+        
+        # 다음 구간으로 이동 (공백 포함)
+        current_length += dash_length * 2
+
+def draw_detection_area(image, detection_area_polygon, scale_x=1.0, scale_y=1.0):
+    """기본 감지 영역을 연두색 테두리로 그리기"""
+    if detection_area_polygon is None:
+        return image
+    
+    try:
+        # polygon 좌표 추출 및 스케일링
+        coords = np.array(detection_area_polygon.exterior.coords, dtype=np.float32)
+        scaled_coords = coords * [scale_x, scale_y]
+        scaled_coords = scaled_coords.astype(np.int32)
+        
+        # 연두색 (BGR: 0, 255, 0) 테두리로 그리기
+        lime_green = (83, 255, 76)
+        thickness = 8
+        
+        cv2.polylines(image, [scaled_coords], isClosed=True, color=lime_green, thickness=thickness)
+        
+        # # 기본 감지 영역 라벨 표시 (polygon의 중심점에)
+        # try:
+        #     centroid = detection_area_polygon.centroid
+        #     text_x = int(centroid.x * scale_x)
+        #     text_y = int(centroid.y * scale_y)
+            
+        #     text = "Detection Area"
+        #     font = cv2.FONT_HERSHEY_SIMPLEX
+        #     font_scale = 0.8
+        #     thickness = 2
+        #     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            
+        #     # 배경 사각형 (연두색)
+        #     cv2.rectangle(image, (text_x - 5, text_y - text_h - 10), 
+        #                  (text_x + text_w + 5, text_y + 5), lime_green, -1)
+            
+        #     # 텍스트 (검은색)
+        #     cv2.putText(image, text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness)
+            
+        # except Exception as e:
+        #     print(f"⚠️ 기본 감지 영역 라벨 그리기 오류: {e}")
+        
+    except Exception as e:
+        print(f"💥 기본 감지 영역 그리기 오류: {e}")
+    
+    return image
+
+
 # ─────────────────────── ObjectMeta Conversion ────────────────────────────── #
-def convert_results_to_objects(cpu_result, class_names, args=None) -> list[ObjectMeta]:
+def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=None, args=None) -> list[ObjectMeta]:
     """
     CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환
     Confidence 기준에 따른 클래스 할당:
@@ -407,9 +1058,10 @@ def convert_results_to_objects(cpu_result, class_names, args=None) -> list[Objec
     global _debug_frame_count, _max_debug_frames
     
     objects = []
+    filtered_count = 0  # 필터링된 객체 수 (통계용)
     
     if not cpu_result['has_boxes']:
-        return objects
+        return objects, filtered_count
     
     boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
     confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
@@ -562,8 +1214,14 @@ def convert_results_to_objects(cpu_result, class_names, args=None) -> list[Objec
     
     # 디버그 카운터 증가
     _debug_frame_count += 1
+
+    # 🎯 기본 감지 영역 필터링 (있는 경우에만)
+    if detection_area_polygon is None or is_bbox_center_in_polygon(obj.box, detection_area_polygon):
+        objects.append(obj)  # 조건 만족시에만 추가
+    else:
+        filtered_count += 1  # 필터링된 객체 수 증가
     
-    return objects
+    return objects, filtered_count
 
 
 # ─────────────────────── Direct Overlay Functions ────────────────────────────── #
@@ -619,7 +1277,7 @@ def draw_mask(image, mask, track_id, class_id, color_palette, opacity=0.4):
     return image
 
 def draw_label(image, box, track_id, class_name, confidence, color_palette):
-    """라벨 그리기"""
+    """🏷️ 라벨 그리기 (이미지 경계 고려)"""
     x1, y1, x2, y2 = map(int, box)
     # 음수 track_id를 양수로 변환
     safe_track_id = abs(track_id) if track_id < 0 else track_id
@@ -634,13 +1292,32 @@ def draw_label(image, box, track_id, class_name, confidence, color_palette):
     thickness = 2
     (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
     
+    # 이미지 크기 가져오기
+    img_height, img_width = image.shape[:2]
+    
+    # 라벨 높이 계산 (패딩 포함)
+    label_height = text_h + baseline + 10
+    
+    # 🎯 라벨 위치 결정: bbox 위쪽에 공간이 있는지 확인
+    if y1 - label_height >= 0:
+        # bbox 위쪽에 충분한 공간이 있음 → 위쪽에 그리기 (기존 방식)
+        label_y_top = y1 - text_h - baseline - 10
+        label_y_bottom = y1
+        text_y = y1 - baseline - 5
+    else:
+        label_y_top = y1
+        label_y_bottom = y1 + text_h + baseline + 10
+        text_y = y1 + text_h + 5
+    
+    # 라벨이 이미지 우측을 벗어나는 경우 x 좌표 조정
+    if x1 + text_w >= img_width:
+        x1 = max(0, img_width - text_w)
+    
     # 라벨 배경 그리기
-    cv2.rectangle(image, (x1, y1 - text_h - baseline - 10), 
-                  (x1 + text_w, y1), color, -1)
+    cv2.rectangle(image, (x1, label_y_top), (x1 + text_w, label_y_bottom), color, -1)
     
     # 텍스트 그리기
-    cv2.putText(image, label, (x1, y1 - baseline - 5), 
-                font, font_scale, (255, 255, 255), thickness)
+    cv2.putText(image, label, (x1, text_y), font, font_scale, (255, 255, 255), thickness)
     
     return image
 
@@ -804,30 +1481,36 @@ class InferenceThread(threading.Thread):
     Frame Loading Thread → Inference Thread → Main Thread 파이프라인의 중간 단계
     """
     
-    def __init__(self, frame_queue, result_queue, model_vp, args):
+    def __init__(self, frame_queue, result_queue, model_vp, args, detection_area_polygon=None):
         super().__init__(daemon=True)
         self.frame_queue = frame_queue
         self.result_queue = result_queue
         self.model_vp = model_vp
         self.args = args
+        self.detection_area_polygon = detection_area_polygon  # 결과 패키징에서 사용
         self.stop_event = threading.Event()
         self.prev_vpe = None  # VPE 상태 관리
         self.stats = {
             'total_batches_processed': 0,
             'total_frames_processed': 0,
             'vpe_updates': 0,
-            'failed_batches': 0
+            'failed_batches': 0,
+            'filtered_objects': 0  # 필터링된 객체 수 통계 추가
         }
         
         print(f"\n🧠 Inference Thread 초기화:")
         print(f"   - GPU 디바이스: {args.device}")
         print(f"   - Cross-VP 모드: {'활성화' if args.cross_vp else '비활성화'}")
+        print(f"   - Inference Confidence Threshold: {args.conf_thresh}")
+        print(f"   - VP Confidence Threshold: {args.vp_thresh}")
+        print(f"   - Inference IoU Threshold: {args.iou_thresh}")
         print(f"   - VPE 모멘텀: {args.vpe_momentum}")
         print(f"\n📊 Confidence 기준:")
         print(f"   - conf >= {args.high_conf_thresh}  : VPE 업데이트 + 정상 클래스")
         print(f"   - conf >= {args.medium_conf_thresh}  : 정상 클래스 부여")
         print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 'object' 클래스 + VPE 추가")
         print(f"   - conf < {args.very_low_conf_thresh}  : 필터링 (사용하지 않음)")
+        print(f"   - 기본 감지 영역: {'설정됨' if detection_area_polygon else '미설정'}")
     
     def stop(self):
         """스레드 종료 요청"""
@@ -856,7 +1539,7 @@ class InferenceThread(threading.Thread):
                     # 배치 데이터 언패킹
                     batch_frames = batch_data['batch_frames']
                     batch_indices = batch_data['batch_indices']
-                    batch_original_frames = batch_data['batch_original_frames']
+                    # batch_original_frames = batch_data['batch_original_frames']
                     loaded_count = batch_data['loaded_count']
                     
                     if not batch_frames:
@@ -878,9 +1561,24 @@ class InferenceThread(threading.Thread):
                     if self.args.cross_vp:
                         vpe_updated = self._update_vpe(batch_results)
                     
-                    # 결과 패키징
+                    # 🎯 결과 패키징: 여기서 cpu_result → ObjectMeta 변환! (딱 한 번만!)
+                    batch_detected_objects = []  # ObjectMeta 리스트들
+                    batch_original_frames = []   # 원본 프레임들
+                    
+                    for cpu_result in batch_results:
+                        # 🎯 cpu_result → ObjectMeta 변환 + 기본 감지 영역 필터링
+                        detected_objects, filtered_count = convert_results_to_objects(
+                            cpu_result, self.args.names, self.detection_area_polygon
+                        )
+                        
+                        # 필터링 통계 업데이트
+                        self.stats['filtered_objects'] += filtered_count
+                        
+                        batch_detected_objects.append(detected_objects)
+                        batch_original_frames.append(cpu_result['orig_img'])
+                    
                     result_data = {
-                        'batch_results': batch_results,
+                        'batch_detected_objects': batch_detected_objects,  # ObjectMeta 리스트들
                         'batch_indices': batch_indices,
                         'batch_original_frames': batch_original_frames,
                         'loaded_count': loaded_count,
@@ -942,6 +1640,7 @@ class InferenceThread(threading.Thread):
             print(f"   - 처리된 프레임 수: {self.stats['total_frames_processed']}")
             print(f"   - VPE 업데이트 횟수: {self.stats['vpe_updates']}")
             print(f"   - 실패한 배치 수: {self.stats['failed_batches']}")
+            print(f"   - 기본 감지 영역에서 필터링된 객체 수: {self.stats['filtered_objects']}")
             print("🚀 GPU 메모리 완전 정리 완료!")
     
     def _inference_batch(self, batch_frames):
@@ -973,6 +1672,7 @@ class InferenceThread(threading.Thread):
             
             # 🔥 GPU → CPU 변환을 여기서 수행하여 메모리 효율성 확보!
             cpu_results = []
+            
             for result in results:
                 cpu_result = {
                     'boxes_xyxy': result.boxes.xyxy.cpu().numpy() if len(result.boxes) > 0 else np.empty((0, 4)),
@@ -1171,6 +1871,10 @@ class InferenceThread(threading.Thread):
             import torch
             torch.cuda.empty_cache()
             return None
+    
+
+    
+
 
 
 # ─────────────────────── Frame Loading Thread Class ────────────────────────────── #
@@ -1543,7 +2247,7 @@ def preprocess_image(image, args):
     return img
 
 # ANCHOR Detection Result Processing
-def process_batch_results(batch_results, batch_indices, batch_original_frames, 
+def process_batch_results(batch_detected_objects, batch_indices, batch_original_frames, 
                          tracker, args, fps, palette, person_class_id,
                          # 상태 변수들
                          track_history, track_side, track_color, 
@@ -1552,10 +2256,14 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                          # I/O 관련
                          output_dir, out, log_file,
                          # 라인 크로싱 관련
-                         p1, p2, seg_dx, seg_dy, seg_len2,
-                         width, height,
+                         p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
+                         width, height, output_width, output_height, scale_x, scale_y,
                          # Progress bar & Queue monitoring
-                         pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None):
+                         pbar=None, frame_queue=None, result_queue=None, pipeline_stats=None,
+                         # ROI Access Detection
+                         roi_manager=None,
+                         # Basic Detection Area
+                         detection_area_polygon=None):
     """Batch 결과를 개별 프레임으로 처리 (CPU 데이터 기반)"""
     
     updated_state = {
@@ -1567,7 +2275,7 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         'last_save_frame': last_save_frame
     }
     
-    for cpu_result, frame_idx, original_frame in zip(batch_results, batch_indices, batch_original_frames):
+    for detected_objects, frame_idx, original_frame in zip(batch_detected_objects, batch_indices, batch_original_frames):
         # 시간 계산
         current_time = frame_idx / fps
         hours = int(current_time // 3600)
@@ -1576,32 +2284,17 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
         milliseconds = int((current_time % 1) * 1000)
         time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
         
-        # ObjectMeta 변환 (CPU 데이터 기반)
-        detected_objects = convert_results_to_objects(cpu_result, args.names, args)
+        # 🚀 ObjectMeta 이미 준비됨! (InferenceThread에서 변환 + 필터링 완료)
+        # detected_objects는 이미 필터링된 ObjectMeta 리스트
         
-        # 🔍 디버깅: 검출 객체 상황 확인 (처음 몇 프레임만)
-        global _debug_frame_count, _max_debug_frames
-        if _debug_frame_count <= _max_debug_frames:
-            print(f"🎯 프레임 {frame_idx} - 검출 객체:")
-            print(f"   - 전체 검출 객체: {len(detected_objects)}개")
-            
-            # confidence별 분포 확인 (count는 convert_results_to_objects에서 이미 처리됨)
-            high_conf = [obj for obj in detected_objects if obj.confidence >= args.high_conf_thresh]
-            medium_conf = [obj for obj in detected_objects if args.medium_conf_thresh <= obj.confidence < args.high_conf_thresh]
-            low_conf = [obj for obj in detected_objects if args.very_low_conf_thresh <= obj.confidence < args.medium_conf_thresh]
-            very_low_conf = [obj for obj in detected_objects if obj.confidence < args.very_low_conf_thresh]
-            
-            print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {len(high_conf)}개")
-            print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {len(medium_conf)}개")
-            print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {len(low_conf)}개")
-            print(f"   - 초저신뢰도 (<{args.very_low_conf_thresh}): {len(very_low_conf)}개")
-            
-            if low_conf:
-                conf_list = [f"{obj.confidence:.3f}" for obj in low_conf]
-                print(f"   - 저신뢰도 confidence: {', '.join(conf_list)}")
+        # Tracker 업데이트 (기존 로직 유지)
+        tracked_objects = tracker.update(detected_objects, original_frame, "None")
         
-        # 🔥 모든 객체를 tracker에 전달 (정상 객체 + 저신뢰도 객체 모두 포함)
-        tracked_objects = tracker.update(detected_objects, cpu_result['orig_img'], "None")
+        # ROI Access Detection 업데이트
+        roi_tracks_status = {}
+        if roi_manager is not None:
+            roi_manager.update(tracked_objects, frame_idx, original_frame.shape)
+            roi_tracks_status = roi_manager.get_roi_tracks_by_status()
         
         # 🎨 모든 추적된 객체들을 오버레이에 표시
         all_objects_for_overlay = tracked_objects
@@ -1649,13 +2342,63 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                     log_file.flush()
                     log_buffer.clear()
 
-        # 시각화
+        # 시각화 - 출력 해상도로 리사이즈
         frame_rgb = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+        
+        # 출력 해상도와 입력 해상도가 다르면 리사이즈
+        if output_width != width or output_height != height:
+            frame_rgb = cv2.resize(frame_rgb, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+        
         annotated = frame_rgb.copy()
         
-        # 🎨 모든 객체들(추적된 객체 + 저신뢰도 객체)을 오버레이에 표시
-        if all_objects_for_overlay:
-            annotated = draw_objects_overlay(annotated, all_objects_for_overlay, palette, args)
+        # 기본 감지 영역 시각화 (출력 해상도에 맞게 스케일링)
+        if detection_area_polygon is not None:
+            annotated = draw_detection_area(annotated, detection_area_polygon, scale_x, scale_y)    
+        
+        # 객체 오버레이 (스케일링된 좌표로)
+        scaled_objects = []
+        if tracked_objects:
+            # 객체 좌표를 출력 해상도에 맞게 스케일링
+            for obj in tracked_objects:
+                scaled_obj = ObjectMeta(
+                    box=[obj.box[0] * scale_x, obj.box[1] * scale_y, 
+                         obj.box[2] * scale_x, obj.box[3] * scale_y],
+                    mask=None,  # 마스크는 별도 처리
+                    confidence=obj.confidence,
+                    class_id=obj.class_id,
+                    class_name=obj.class_name,
+                    track_id=obj.track_id
+                )
+                
+                # 마스크가 있으면 출력 해상도로 리사이즈
+                if obj.mask is not None:
+                    scaled_obj.mask = cv2.resize(obj.mask.astype(np.float32), 
+                                               (output_width, output_height), 
+                                               interpolation=cv2.INTER_LINEAR)
+                
+                scaled_objects.append(scaled_obj)
+            
+            annotated = draw_objects_overlay(annotated, scaled_objects, palette)
+
+        # ROI 시각화 (출력 해상도에 맞게 스케일링)
+        if roi_manager is not None:
+            # ROI polygon을 출력 해상도에 맞게 스케일링
+            scaled_roi_polygons = []
+            for polygon in roi_manager.roi_polygons:
+                coords = np.array(polygon.exterior.coords)
+                scaled_coords = coords * [scale_x, scale_y]
+                from shapely.geometry import Polygon
+                scaled_polygon = Polygon(scaled_coords)
+                scaled_roi_polygons.append(scaled_polygon)
+            
+            # ROI polygon 그리기 (스케일링된 좌표로)
+            annotated = draw_roi_polygons(annotated, scaled_roi_polygons, 
+                                        roi_manager.roi_names, roi_manager.roi_stats)
+        
+            # 🎯 ROI에 있는 객체들 상태별 하이라이트 (스케일링된 객체로)
+            if tracked_objects:
+                annotated = highlight_roi_objects(annotated, scaled_objects, 
+                                                roi_tracks_status, palette)
 
         # Occupancy 업데이트
         raw_occupancy = int(np.sum(class_ids == person_class_id))
@@ -1690,10 +2433,10 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             if obj.track_id not in track_color:
                 track_color[obj.track_id] = palette.by_idx(obj.track_id).as_bgr()
 
-            # 라인 크로싱 체크
-            if p1 is not None and p2 is not None:
-                side_now = point_side((cx, cy), p1, p2)
-                t = ((cx - p1[0]) * seg_dx + (cy - p1[1]) * seg_dy) / seg_len2
+            # 라인 크로싱 체크 (입력 해상도 기준 좌표 사용)
+            if p1_input is not None and p2_input is not None:
+                side_now = point_side((cx, cy), p1_input, p2_input)
+                t = ((cx - p1_input[0]) * seg_dx + (cy - p1_input[1]) * seg_dy) / seg_len2
                 inside = 0.0 <= t <= 1.0
 
                 side_prev = track_side.get(obj.track_id, side_now)
@@ -1706,12 +2449,14 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
                 if inside and side_now != 0:
                     track_side[obj.track_id] = side_now
 
-        # 라인 그리기
+        # 라인 그리기 (출력 해상도에 맞게 스케일링)
         if p1 is not None and p2 is not None:
+            line_thickness = 8
+            
             if line_crossed_this_frame:
-                cv2.line(annotated, p1, p2, (255, 0, 0), 8)
+                cv2.line(annotated, p1, p2, (255, 0, 0), line_thickness)
             else:
-                cv2.line(annotated, p1, p2, (255, 255, 255), 8)
+                cv2.line(annotated, p1, p2, (255, 255, 255), line_thickness)
 
             mid_x, mid_y = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
             dx, dy = p2[0] - p1[0], p2[1] - p1[1]
@@ -1720,49 +2465,90 @@ def process_batch_results(batch_results, batch_indices, batch_original_frames,
             mag = (perp_x**2 + perp_y**2) ** 0.5 or 1
             perp_x, perp_y = int(perp_x / mag * length), int(perp_y / mag * length)
             arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
-            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), 8, tipLength=0.6)
+            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), line_thickness, tipLength=0.6)
 
-        # # Overlay 정보 그리기
-        # overlay = [
-        #     f"[1] Congestion : {updated_state['current_congestion']:3d} %",
-        #     f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
-        #     f"[3] Occupancy  : {updated_state['current_occupancy']}",
-        #     f"[4] Time      : {time_str}"
-        # ]
-        # x0, y0, dy = 30, 60, 50
-        # font = cv2.FONT_HERSHEY_SIMPLEX
-        # font_scale = 1
-        # font_thickness = 2
-        # padding = 10
-        # max_width = 0
-        # for txt in overlay:
-        #     (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
-        #     max_width = max(max_width, tw)
-        # rect_x1, rect_y1 = x0 - padding, y0 - th - padding
-        # rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
-        # overlay_rect = annotated.copy()
-        # cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
-        # annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
-        # for i, txt in enumerate(overlay):
-        #     cv2.putText(annotated, txt, (x0, y0 + i * dy),
-        #                 font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+        # Overlay 정보 그리기 (ROI 정보 추가)
+        overlay = [
+            f"[1] Congestion : {updated_state['current_congestion']:3d} %",
+            f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
+            f"[3] Occupancy  : {updated_state['current_occupancy']}",
+            f"[4] Time      : {time_str}"
+        ]
+        
+        # ROI 접근 횟수 정보 추가
+        if roi_manager is not None:
+            for roi_name, roi_stat in roi_manager.roi_stats.items():
+                overlay.append(f"[ROI] {roi_name}: {roi_stat['total_access']} accesses")
+        
+        # 오버레이 텍스트 크기 (0~1 정규화 좌표를 출력 해상도에 맞게 스케일링)
+        # 1920x1080 기준: x0=30, y0=60, dy=50, padding=10
+        # 정규화: x0=30/1920=0.0156, y0=60/1080=0.0556, dy=50/1080=0.0463, padding=10/1920=0.0052
+        
+        # 정규화된 좌표 (0~1 범위)
+        norm_x0, norm_y0, norm_dy, norm_padding = 0.0156, 0.0556, 0.0463, 0.0052
+        
+        # 출력 해상도에 맞게 스케일링
+        x0 = int(norm_x0 * output_width)
+        y0 = int(norm_y0 * output_height)
+        dy = int(norm_dy * output_height)
+        padding = int(norm_padding * output_width)
+        
+        # 폰트 크기도 출력 해상도에 맞게 스케일링
+        # 1920x1080 기준: font_scale=1, font_thickness=2
+        # 정규화: font_scale=1, font_thickness=2 (기본값 유지, 필요시 조정 가능)
+        base_font_scale = 1.0
+        base_font_thickness = 2
+        
+        # 출력 해상도에 따른 폰트 크기 조정 (1920x1080 기준으로 정규화)
+        scale_factor = min(output_width / 1920, output_height / 1080)
+        font_scale = base_font_scale * scale_factor
+        font_thickness = max(1, int(base_font_thickness * scale_factor))
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        max_width = 0
+        for txt in overlay:
+            (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
+            max_width = max(max_width, tw)
+        rect_x1, rect_y1 = x0 - padding, y0 - th - padding
+        rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
+        overlay_rect = annotated.copy()
+        cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
+        annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
+        for i, txt in enumerate(overlay):
+            cv2.putText(annotated, txt, (x0, y0 + i * dy),
+                        font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
 
-        # 히트맵 minimap
+        # 히트맵 minimap (출력 해상도에 맞게 조정)
         blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
         norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
         color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
 
-        mini_w = 400
-        mini_h = int(height * mini_w / width)
+        # 미니맵 크기를 출력 해상도에 맞게 조정 (0~1 정규화 좌표 사용)
+        # 1920x1080 기준: mini_w=400, margin=20
+        # 정규화: mini_w=400/1920=0.2083, margin=20/1920=0.0104
+        
+        # 정규화된 크기 (0~1 범위)
+        norm_mini_width = 0.2083  # 화면 너비의 20.83%
+        norm_margin = 0.0104      # 화면 너비의 1.04%
+        
+        # 출력 해상도에 맞게 스케일링
+        mini_w = int(norm_mini_width * output_width)
+        mini_h = int(output_height * mini_w / output_width)
+        margin = int(norm_margin * output_width)
+        
         mini_map = cv2.resize(color_hm, (mini_w, mini_h))
 
-        margin = 20
-        x_start = width - mini_w - margin
+        # 미니맵 위치 계산 (우상단)
+        x_start = output_width - mini_w - margin
         y_start = margin
-        roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
-        blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
-        annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
+        
+        # 경계 체크
+        if x_start >= 0 and y_start >= 0 and x_start + mini_w <= output_width and y_start + mini_h <= output_height:
+            roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
+            blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
+            annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
 
         # 중간 저장
         if frame_idx - updated_state['last_save_frame'] >= args.save_interval:
@@ -1845,12 +2631,29 @@ def main() -> None:
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video {args.source}")
 
-    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # 입력 해상도
+    input_width, input_height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps, total_frames = cap.get(cv2.CAP_PROP_FPS), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     # 🔥 limit_frame에서 중단하도록 제한
     total_frames = min(total_frames, args.limit_frame)
     print(f"📹 프레임 처리 제한: {total_frames}프레임까지 처리 (limit: {args.limit_frame})")
+    
+    # 출력 해상도 설정 (args에서 지정하지 않으면 입력 해상도 사용)
+    output_width = args.output_width if args.output_width is not None else input_width
+    output_height = args.output_height if args.output_height is not None else input_height
+    
+    # 스케일링 비율 계산
+    scale_x = output_width / input_width
+    scale_y = output_height / input_height
+    
+    print(f"\n📺 해상도 설정:")
+    print(f"   - 입력 해상도: {input_width} x {input_height}")
+    print(f"   - 출력 해상도: {output_width} x {output_height}")
+    print(f"   - 스케일링 비율: x={scale_x:.3f}, y={scale_y:.3f}")
+    
+    # 기존 변수명 호환성을 위해 width, height는 입력 해상도로 유지 (내부 로직용)
+    width, height = input_width, input_height
 
     # Select frames to process
     frames_to_process = range(total_frames)
@@ -2019,12 +2822,22 @@ def main() -> None:
     
     model_vp.predictor = None
 
+    # ─────────────── 기본 감지 영역 설정 ──────────────── #
+    detection_area_polygon = None
+    if args.detection_area:
+        detection_area_polygon = parse_detection_area(args.detection_area)
+        if detection_area_polygon is None:
+            print("⚠️ 기본 감지 영역 파싱 실패, 기본 감지 영역 기능 비활성화")
+    else:
+        print("🎯 기본 감지 영역 미설정, 모든 객체 감지")    
+
     # Inference Thread 시작
     inference_thread = InferenceThread(
         frame_queue=frame_queue,
         result_queue=result_queue,
         model_vp=model_vp,
-        args=args
+        args=args,
+        detection_area_polygon=detection_area_polygon
     )
     inference_thread.start()
     # print(f"🧠 Stage 2 시작: Inference Thread (PID: {inference_thread.ident})")
@@ -2041,14 +2854,20 @@ def main() -> None:
 
     # ─────────────── Counting line (pixel) ───── #
     if args.line_start is not None and args.line_end is not None:
-        p1 = (int(args.line_end[0]   * width),  int(args.line_end[1]   * height))
-        p2 = (int(args.line_start[0] * width),  int(args.line_start[1] * height))
+        # 입력 해상도 기준으로 라인 좌표 계산 (내부 로직용)
+        p1_input = (int(args.line_end[0]   * width),  int(args.line_end[1]   * height))
+        p2_input = (int(args.line_start[0] * width),  int(args.line_start[1] * height))
         
-        # 선분 벡터 및 길이² 계산
-        seg_dx, seg_dy = p2[0] - p1[0], p2[1] - p1[1]
+        # 출력 해상도 기준으로 라인 좌표 계산 (시각화용)
+        p1 = (int(args.line_end[0]   * output_width),  int(args.line_end[1]   * output_height))
+        p2 = (int(args.line_start[0] * output_width),  int(args.line_start[1] * output_height))
+        
+        # 선분 벡터 및 길이² 계산 (입력 해상도 기준, 내부 로직용)
+        seg_dx, seg_dy = p2_input[0] - p1_input[0], p2_input[1] - p1_input[1]
         seg_len2 = seg_dx * seg_dx + seg_dy * seg_dy or 1
     else:
         p1 = p2 = None
+        p1_input = p2_input = None
         seg_dx = seg_dy = seg_len2 = 0
 
     # ─────────────── Runtime state ───────────── #
@@ -2075,6 +2894,31 @@ def main() -> None:
     # Heat-map 누적 버퍼
     heatmap = np.zeros((height, width), dtype=np.float32)
 
+    # ─────────────── ROI Access Detection 설정 ──────────────── #
+    roi_manager = None
+    if args.roi_zones:
+        # ROI zones 파싱
+        roi_polygons = parse_roi_zones(args.roi_zones)
+        if roi_polygons:
+            # ROI names 파싱
+            roi_names = parse_roi_names(args.roi_names, len(roi_polygons))
+            
+            # ROI Access Manager 초기화
+            roi_manager = ROIAccessManager(
+                roi_polygons=roi_polygons,
+                roi_names=roi_names,
+                detection_method=args.roi_detection_method,
+                dwell_time=args.roi_dwell_time,
+                bbox_threshold=args.roi_bbox_threshold,
+                mask_threshold=args.roi_mask_threshold,
+                fps=fps,
+                exit_grace_time=args.roi_exit_grace_time
+            )
+        else:
+            print("⚠️ ROI zones 파싱 실패, ROI 기능 비활성화")
+    else:
+        print("📍 ROI zones 미설정, ROI 기능 비활성화")
+
     # 라인 깜박임 상태
     line_flash = False
 
@@ -2088,10 +2932,10 @@ def main() -> None:
     last_save_frame = 0
     log_buffer = []  # 로그 버퍼
 
-    # 비디오 출력 설정
+    # 비디오 출력 설정 (출력 해상도 사용)
     out = cv2.VideoWriter(output_video,
                         cv2.VideoWriter_fourcc(*'mp4v'),
-                        fps, (width, height))
+                        fps, (output_width, output_height))
 
     # Pipeline 통계
     pipeline_stats = {
@@ -2119,7 +2963,7 @@ def main() -> None:
                     break
                 
                 # 결과 데이터 언패킹
-                batch_results = result_data['batch_results']
+                batch_detected_objects = result_data['batch_detected_objects']
                 batch_indices = result_data['batch_indices']
                 batch_original_frames = result_data['batch_original_frames']
                 loaded_count = result_data['loaded_count']
@@ -2129,14 +2973,14 @@ def main() -> None:
                 
                 # print(f"📊 Main Thread: Batch {batch_idx + 1} 처리 시작 ({loaded_count} 프레임)")
                 
-                if not batch_results:
+                if not batch_detected_objects:
                     print("⚠️ 빈 결과 수신, 건너뛰기")
                     batch_idx += 1
                     continue
                 
                 # ──────── 3. Batch 결과 처리 (CPU 작업) ──────── #
                 updated_state = process_batch_results(
-                    batch_results, batch_indices, batch_original_frames,
+                    batch_detected_objects, batch_indices, batch_original_frames,
                     tracker, args, fps, palette, person_class_id,
                     # 상태 변수들
                     track_history, track_side, track_color, 
@@ -2145,10 +2989,14 @@ def main() -> None:
                     # I/O 관련
                     output_dir, out, log_file,
                     # 라인 크로싱 관련
-                    p1, p2, seg_dx, seg_dy, seg_len2,
-                    width, height,
+                    p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
+                    width, height, output_width, output_height, scale_x, scale_y,
                     # Progress bar & Queue monitoring
-                    pbar, frame_queue, result_queue, pipeline_stats
+                    pbar, frame_queue, result_queue, pipeline_stats,
+                    # ROI Access Detection
+                    roi_manager,
+                    # Basic Detection Area
+                    detection_area_polygon
                 )
                 
                 # 상태 변수 업데이트
@@ -2261,6 +3109,14 @@ def main() -> None:
     global confidence_stats
     confidence_stats.print_stats(args)
     
+    # ROI 최종 통계 출력 및 저장
+    if roi_manager is not None:
+        roi_manager.print_final_statistics()
+        
+        # ROI 통계 JSON 파일로 저장
+        roi_stats_path = os.path.join(output_dir, "roi_statistics.json")
+        roi_manager.save_statistics(roi_stats_path)
+    
     # if args.cross_vp and prev_vpe is not None:
     #     print(f"🧠 VPE 정보:")
     #     print(f"   - VPE shape: {prev_vpe.shape}")
@@ -2291,6 +3147,7 @@ def main() -> None:
         print(f"   - 처리된 프레임 수: {inference_stats['total_frames_processed']}")
         print(f"   - VPE 업데이트 횟수: {inference_stats['vpe_updates']}")
         print(f"   - 실패한 배치 수: {inference_stats['failed_batches']}")
+        print(f"   - 기본 감지 영역 필터링된 객체 수: {inference_stats['filtered_objects']}")
         
         # GPU 효율성 계산
         if inference_stats['total_batches_processed'] > 0:

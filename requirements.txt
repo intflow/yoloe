@@ -2,3 +2,5 @@
 -e third_party/lvis-api
 -e third_party/ml-mobileclip
 -e third_party/CLIP
+
+shapely
