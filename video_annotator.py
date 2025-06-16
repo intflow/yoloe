@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
     # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    parser.add_argument("--source", type=str, default="../10s_test.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -1215,13 +1215,15 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
     # 디버그 카운터 증가
     _debug_frame_count += 1
 
-    # 🎯 기본 감지 영역 필터링 (있는 경우에만)
-    if detection_area_polygon is None or is_bbox_center_in_polygon(obj.box, detection_area_polygon):
-        objects.append(obj)  # 조건 만족시에만 추가
-    else:
-        filtered_count += 1  # 필터링된 객체 수 증가
+    # 🎯 기본 감지 영역 필터링된 objects를 정리해서 반환
+    filtered_objects = []
+    for obj in objects:
+        if detection_area_polygon is None or is_bbox_center_in_polygon(obj.box, detection_area_polygon):
+            filtered_objects.append(obj)  # 조건 만족시에만 추가
+        else:
+            filtered_count += 1  # 필터링된 객체 수 증가
     
-    return objects, filtered_count
+    return filtered_objects, filtered_count
 
 
 # ─────────────────────── Direct Overlay Functions ────────────────────────────── #
@@ -1568,7 +1570,7 @@ class InferenceThread(threading.Thread):
                     for cpu_result in batch_results:
                         # 🎯 cpu_result → ObjectMeta 변환 + 기본 감지 영역 필터링
                         detected_objects, filtered_count = convert_results_to_objects(
-                            cpu_result, self.args.names, self.detection_area_polygon
+                            cpu_result, self.args.names, self.detection_area_polygon, self.args
                         )
                         
                         # 필터링 통계 업데이트
