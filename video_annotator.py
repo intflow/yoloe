@@ -58,15 +58,18 @@ class ConfidenceStats:
     
     def print_stats(self, args):
         total = self.get_total()
+        vpe_update_count = self.high_conf_count + self.medium_conf_count  # 0.1 이상 모두 VPE 업데이트
         print(f"📊 Confidence 분포 (전체):")
         print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {self.high_conf_count}개")
         print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {self.medium_conf_count}개")
+        print(f"   - VPE 업데이트용 (≥{args.medium_conf_thresh}): {vpe_update_count}개")
         print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {self.low_conf_count}개")
         print(f"   - 초저신뢰도 (<{args.very_low_conf_thresh}): {self.very_low_conf_count}개")
         if total > 0:
             print(f"   - 총 detection 수: {total}개")
             print(f"   - 고신뢰도 비율: {self.high_conf_count/total*100:.1f}%")
             print(f"   - 중신뢰도 비율: {self.medium_conf_count/total*100:.1f}%")
+            print(f"   - VPE 업데이트 비율: {vpe_update_count/total*100:.1f}%")
             print(f"   - 저신뢰도 비율: {self.low_conf_count/total*100:.1f}%")
             print(f"   - 초저신뢰도 비율: {self.very_low_conf_count/total*100:.1f}%")
 
@@ -119,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     # NOTE [args] text prompt
     parser.add_argument("--names", nargs="+",
                         # default=["fish", "disco ball", "object"],
-                        default=["pig", "disco ball", "object"],
+                        default=["pig", "disco ball"],
                         help="Custom class names list (index order matters)")
     # NOTE [args] GPU Device
     parser.add_argument("--device", type=str, default="cuda:0",
@@ -151,16 +154,16 @@ def parse_args() -> argparse.Namespace:
     # Snapshot
     parser.add_argument("--cross-vp", type=bool, default=True,
                         help="Enable cross visual prompt mode")
-    parser.add_argument("--save-interval", type=int, default=30,
+    parser.add_argument("--save-interval", type=int, default=65,
                         help="Interval for saving intermediate frames")
     # NOTE [args] Batch processing
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
-    parser.add_argument("--vpe-momentum", type=float, default=0.9,
+    parser.add_argument("--vpe-momentum", type=float, default=0.1,
                         help="VPE moving average momentum")
-    parser.add_argument("--limit-frame", type=int, default=151,
+    parser.add_argument("--limit-frame", type=int, default=1201,
                         help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -1161,9 +1164,9 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
             print(f"⚠️ 마스크 변환 오류: {e}")
             masks = None
     
-    # 'object' 클래스의 인덱스 찾기 (마지막 클래스로 가정)
-    object_class_id = len(class_names) - 1
-    object_class_name = class_names[object_class_id] if object_class_id < len(class_names) else "object"
+    # 저신뢰도 객체용 임시 클래스 정보 (실제 클래스 목록에는 포함되지 않음)
+    low_object_class_id = -1  # 특별한 ID로 구분
+    low_object_class_name = "low_object"
     
     # 🔍 클래스 할당 디버깅용 카운터
     high_conf_assigned = 0
@@ -1184,12 +1187,12 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
             else:
                 medium_conf_assigned += 1
         else:  # args.very_low_conf_thresh <= conf < args.medium_conf_thresh
-            # 'object' 클래스로 부여
-            final_class_id = object_class_id
-            final_class_name = object_class_name
+            # 임시 'low_object' 클래스로 부여 (tracker 연결 목적)
+            final_class_id = low_object_class_id
+            final_class_name = low_object_class_name
             low_conf_assigned += 1
             if should_debug:
-                print(f"🎯 저신뢰도 객체 발견! conf={conf:.3f}, 원본클래스={class_names[original_class_id] if original_class_id < len(class_names) else 'unknown'} → 'object' 클래스로 할당")
+                print(f"🎯 저신뢰도 객체 발견! conf={conf:.3f}, 원본클래스={class_names[original_class_id] if original_class_id < len(class_names) else 'unknown'} → 'low_object'로 임시 할당 (tracker용)")
         
         obj = ObjectMeta(
             box=boxes[i],
@@ -1203,14 +1206,14 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
         obj.original_class_id = original_class_id
         objects.append(obj)
     
-    # 최종 할당 결과 출력 (디버깅 프레임에서만)
-    if should_debug and len(objects) > 0:
-        print(f"✅ 클래스 할당 완료:")
-        print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {high_conf_assigned}개")
-        print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {medium_conf_assigned}개") 
-        print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh} → 'object'): {low_conf_assigned}개")
-        print(f"   - 총 할당된 객체: {len(objects)}개")
-        print("-" * 50)
+            # 최종 할당 결과 출력 (디버깅 프레임에서만)
+        if should_debug and len(objects) > 0:
+            print(f"✅ 클래스 할당 완료:")
+            print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {high_conf_assigned}개")
+            print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {medium_conf_assigned}개") 
+            print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh} → 'low_object'): {low_conf_assigned}개")
+            print(f"   - 총 할당된 객체: {len(objects)}개")
+            print("-" * 50)
     
     # 디버그 카운터 증가
     _debug_frame_count += 1
@@ -1416,7 +1419,7 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
     medium_thresh = args.medium_conf_thresh if args else 0.1
     
     for obj in objects:
-        if (hasattr(obj, 'class_name') and obj.class_name == 'object' and 
+        if (hasattr(obj, 'class_name') and obj.class_name == 'low_object' and 
             very_low_thresh <= obj.confidence < medium_thresh):
             low_conf_objects.append(obj)
         else:
@@ -1432,8 +1435,8 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
         if low_conf_objects:
             conf_values = [f"{obj.confidence:.3f}" for obj in low_conf_objects]
             track_ids = [f"{obj.track_id}" for obj in low_conf_objects]
-            print(f"   - 저신뢰도 confidence: {', '.join(conf_values)}")
-            print(f"   - 저신뢰도 track_ids: {', '.join(track_ids)}")
+            print(f"   - 저신뢰도 low_object confidence: {', '.join(conf_values)}")
+            print(f"   - 저신뢰도 low_object track_ids: {', '.join(track_ids)}")
     
     all_display_objects = normal_objects + low_conf_objects
     
@@ -1460,8 +1463,8 @@ def draw_objects_overlay(image, objects, color_palette, args=None):
     for obj in all_display_objects:
         display_track_id = obj.track_id if obj.track_id is not None else -999
         
-        # 저신뢰도 'object' 클래스는 특별 스타일로 그리기
-        if (hasattr(obj, 'class_name') and obj.class_name == 'object' and 
+        # 저신뢰도 'low_object' 클래스는 특별 스타일로 그리기
+        if (hasattr(obj, 'class_name') and obj.class_name == 'low_object' and 
             very_low_thresh <= obj.confidence < medium_thresh):
             # 저신뢰도 객체: 점선 박스와 특별 라벨
             image = draw_low_conf_box(image, obj.box, display_track_id, obj.class_id, color_palette)
@@ -1492,6 +1495,7 @@ class InferenceThread(threading.Thread):
         self.detection_area_polygon = detection_area_polygon  # 결과 패키징에서 사용
         self.stop_event = threading.Event()
         self.prev_vpe = None  # VPE 상태 관리
+        self.vpe_update_epoch = 0  # VPE 업데이트 횟수를 epoch으로 사용
         self.stats = {
             'total_batches_processed': 0,
             'total_frames_processed': 0,
@@ -1508,9 +1512,9 @@ class InferenceThread(threading.Thread):
         print(f"   - Inference IoU Threshold: {args.iou_thresh}")
         print(f"   - VPE 모멘텀: {args.vpe_momentum}")
         print(f"\n📊 Confidence 기준:")
-        print(f"   - conf >= {args.high_conf_thresh}  : VPE 업데이트 + 정상 클래스")
-        print(f"   - conf >= {args.medium_conf_thresh}  : 정상 클래스 부여")
-        print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 'object' 클래스 + VPE 추가")
+        print(f"   - conf >= {args.medium_conf_thresh}  : 정상 클래스 + 로깅 (≥0.1)")
+        print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 'low_object' (tracker 연결용)")
+        print(f"   - conf >= {args.very_low_conf_thresh}  : 모두 VPE 업데이트 사용 (≥0.01)")
         print(f"   - conf < {args.very_low_conf_thresh}  : 필터링 (사용하지 않음)")
         print(f"   - 기본 감지 영역: {'설정됨' if detection_area_polygon else '미설정'}")
     
@@ -1641,6 +1645,7 @@ class InferenceThread(threading.Thread):
             print(f"   - 처리된 배치 수: {self.stats['total_batches_processed']}")
             print(f"   - 처리된 프레임 수: {self.stats['total_frames_processed']}")
             print(f"   - VPE 업데이트 횟수: {self.stats['vpe_updates']}")
+            print(f"   - VPE 업데이트 epoch: {self.vpe_update_epoch}")
             print(f"   - 실패한 배치 수: {self.stats['failed_batches']}")
             print(f"   - 기본 감지 영역에서 필터링된 객체 수: {self.stats['filtered_objects']}")
             print("🚀 GPU 메모리 완전 정리 완료!")
@@ -1740,12 +1745,19 @@ class InferenceThread(threading.Thread):
                 if self.prev_vpe is None:
                     # 첫 번째 VPE
                     self.prev_vpe = current_vpe
-                    # print(f"🎯 첫 번째 VPE 설정 완료")
+                    self.vpe_update_epoch = 1
+                    print(f"🎯 첫 번째 VPE 설정 완료 (epoch: {self.vpe_update_epoch})")
                 else:
-                    # VPE Moving Average
-                    momentum = self.args.vpe_momentum
-                    self.prev_vpe = momentum * self.prev_vpe + (1 - momentum) * current_vpe
-                    # print(f"🔄 VPE Moving Average 업데이트 완료")
+                    # VPE 업데이트 횟수 증가
+                    self.vpe_update_epoch += 1
+                    
+                    # 점진적 학습률 적용: 초기에는 높은 학습률, 점진적으로 감소
+                    learning_rate = max(0.05, 0.3 * (0.95 ** self.vpe_update_epoch))
+                    
+                    # Moving Average with dynamic learning rate
+                    self.prev_vpe = (1 - learning_rate) * self.prev_vpe + learning_rate * current_vpe
+                    
+                    print(f"🔄 VPE 점진적 업데이트 완료 (epoch: {self.vpe_update_epoch}, lr: {learning_rate:.4f})")
                 return True
             else:
                 return False
@@ -1756,59 +1768,37 @@ class InferenceThread(threading.Thread):
     
     def _update_batch_vpe(self, batch_results):
         """배치 결과에서 VPE 생성 (CPU 데이터 기반)
-        confidence >= high_conf_thresh인 detection만 VPE 업데이트에 사용
-        very_low_conf_thresh <= confidence < medium_conf_thresh인 'object' 클래스도 embedding에 추가
+        confidence >= very_low_conf_thresh인 모든 detection을 VPE 업데이트에 사용 (0.01 이상)
         """
-        high_conf_prompts = []
-        low_conf_object_prompts = []  # very_low_conf_thresh~medium_conf_thresh confidence의 object 클래스용
+        all_prompts = []  # 모든 valid confidence의 VPE 업데이트용
         
-        # Batch 내 모든 프레임에서 confidence별 detection 수집
+        # Batch 내 모든 프레임에서 valid confidence detection 수집
         for i, cpu_result in enumerate(batch_results):
             if cpu_result['has_boxes']:
                 confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
                 boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
                 class_ids = cpu_result['boxes_cls']  # 이미 CPU numpy array
                 
-                # 1. High confidence (>= high_conf_thresh): VPE 업데이트용
-                high_conf_mask = confidences >= self.args.high_conf_thresh
-                if np.any(high_conf_mask):
+                # very_low_conf_thresh 이상의 모든 detection 사용 (0.01 이상)
+                valid_conf_mask = confidences >= self.args.very_low_conf_thresh
+                if np.any(valid_conf_mask):
                     prompt_data = {
-                        "bboxes": boxes[high_conf_mask],
-                        "cls": class_ids[high_conf_mask],
+                        "bboxes": boxes[valid_conf_mask],
+                        "cls": class_ids[valid_conf_mask],  # 원본 클래스 사용
                         "frame": cpu_result['orig_img'],
                         "frame_idx": i,
-                        "type": "high_conf"
+                        "type": "valid_conf"
                     }
-                    high_conf_prompts.append(prompt_data)
-                
-                # 2. Low confidence (very_low_conf_thresh~medium_conf_thresh): object 클래스로 embedding에 추가
-                low_conf_mask = (confidences >= self.args.very_low_conf_thresh) & (confidences < self.args.medium_conf_thresh)
-                if np.any(low_conf_mask):
-                    # 'object' 클래스 ID (마지막 클래스)
-                    object_class_id = len(self.args.names) - 1
-                    object_cls_array = np.full(np.sum(low_conf_mask), object_class_id, dtype=np.int32)
+                    all_prompts.append(prompt_data)
                     
-                    prompt_data = {
-                        "bboxes": boxes[low_conf_mask],
-                        "cls": object_cls_array,  # 모두 object 클래스
-                        "frame": cpu_result['orig_img'],
-                        "frame_idx": i,
-                        "type": "low_conf_object"
-                    }
-                    low_conf_object_prompts.append(prompt_data)
-                    
-        # 모든 프롬프트를 결합 (high confidence + low confidence object)
-        all_prompts = high_conf_prompts + low_conf_object_prompts
-        
         if all_prompts:
-            # 결합된 프롬프트들로 VPE 생성
+            # 모든 프롬프트들로 VPE 생성
             batch_vpe = self._generate_batch_vpe(all_prompts)
             
             # 통계 출력
-            high_count = len(high_conf_prompts)
-            low_count = len(low_conf_object_prompts)
-            if high_count > 0 or low_count > 0:
-                print(f"🎯 VPE 업데이트: 고신뢰도 {high_count}개, 저신뢰도(object) {low_count}개")
+            total_count = len(all_prompts)
+            if total_count > 0:
+                print(f"🎯 VPE 업데이트: 전체 유효 detection {total_count}개 프레임 (≥0.01)")
             
             return batch_vpe
         else:
@@ -2328,21 +2318,27 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
             class_ids = np.empty(0, int)
             track_ids = np.empty(0, int)
 
-        # 로깅 처리
+        # 로깅 처리 (low_object는 제외)
         if log_file is not None:
             class_counts = defaultdict(int)
-            for cid in class_ids:
-                class_counts[cid] += 1
+            valid_objects = [obj for obj in tracked_objects if obj.class_name != 'low_object']
+            valid_class_ids = [obj.class_id for obj in valid_objects]
+            valid_track_ids = [obj.track_id for obj in valid_objects]
+            
+            for cid in valid_class_ids:
+                if cid >= 0:  # low_object의 class_id는 -1이므로 제외
+                    class_counts[cid] += 1
 
-            for cid, tid in zip(class_ids, track_ids):
-                class_name = args.names[cid]
-                class_count = class_counts[cid]
-                log_entry = f"{time_str},{class_name},{tid},{class_count}\n"
-                log_buffer.append(log_entry)
-                if len(log_buffer) >= 100:
-                    log_file.writelines(log_buffer)
-                    log_file.flush()
-                    log_buffer.clear()
+            for obj in valid_objects:
+                if obj.class_id >= 0:  # low_object 제외
+                    class_name = obj.class_name
+                    class_count = class_counts[obj.class_id]
+                    log_entry = f"{time_str},{class_name},{obj.track_id},{class_count}\n"
+                    log_buffer.append(log_entry)
+                    if len(log_buffer) >= 100:
+                        log_file.writelines(log_buffer)
+                        log_file.flush()
+                        log_buffer.clear()
 
         # 시각화 - 출력 해상도로 리사이즈
         frame_rgb = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
@@ -2596,8 +2592,7 @@ def main() -> None:
     drift_max = HOLD_FR  # 연속 검출 실패시 리셋
     drift_count = 0
     
-    if "object" not in args.names:
-        args.names.append("object")
+    # object 클래스는 따로 만들지 않음 (저신뢰도 detection은 임시로 low_object로 처리)
 
     # 입력 파일 이름에서 확장자를 제외한 기본 이름 추출
     base_name = os.path.splitext(os.path.basename(args.source))[0]
