@@ -220,26 +220,22 @@ class BoostTrack(object):
 
         self.frame_count += 1
 
-        # 정상 confidence와 저신뢰도 객체들 분리
+        # 객체들 분리 및 numpy 배열 생성을 한 번에 처리
         normal_objects = []
         low_conf_objects = []
+        normal_dets = []
         
         for obj in objects:
             if obj.confidence >= 0.1:
                 normal_objects.append(obj)
-            elif 0.01 <= obj.confidence < 0.1 and obj.class_name == 'object':
-                low_conf_objects.append(obj)
-
-        # 정상 객체들을 numpy 배열로 변환
-        if normal_objects:
-            normal_dets = []
-            for obj in normal_objects:
                 x1, y1, x2, y2 = obj.box
                 det = [x1, y1, x2, y2, obj.confidence, obj.class_id]
                 normal_dets.append(det)
-            normal_dets = np.array(normal_dets)
-        else:
-            normal_dets = np.empty((0, 6))
+            elif 0.01 <= obj.confidence < 0.1:
+                low_conf_objects.append(obj)
+        
+        # numpy 배열로 변환
+        normal_dets = np.array(normal_dets) if normal_dets else np.empty((0, 6))
 
         if self.ecc is not None:
             transform = self.ecc(img_numpy, self.frame_count, tag)
@@ -260,7 +256,7 @@ class BoostTrack(object):
                 # Get detections for current class
                 cls_mask = normal_dets[:, 5] == cls
                 cls_dets = normal_dets[cls_mask]
-                cls_objects = [obj for i, obj in enumerate(normal_objects) if normal_dets[i, 5] == cls]
+                cls_objects = [normal_objects[i] for i in range(len(normal_objects)) if cls_mask[i]]
 
                 # Get trackers for current class
                 if cls not in self.trackers_by_class:
