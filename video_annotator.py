@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     # Snapshot
     parser.add_argument("--cross-vp", type=bool, default=True,
                         help="Enable cross visual prompt mode")
-    parser.add_argument("--save-interval", type=int, default=65,
+    parser.add_argument("--save-interval", type=int, default=300,
                         help="Interval for saving intermediate frames")
     # NOTE [args] Batch processing
     parser.add_argument("--batch-size", type=int, default=64,
@@ -165,7 +165,7 @@ def parse_args() -> argparse.Namespace:
                         help="Number of threads for frame loading")
     parser.add_argument("--vpe-momentum", type=float, default=0.1,
                         help="VPE moving average momentum")
-    parser.add_argument("--limit-frame", type=int, default=310,
+    parser.add_argument("--limit-frame", type=int, default=999999,
                         help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -178,9 +178,9 @@ def parse_args() -> argparse.Namespace:
                         help="Image denoising strength (0.0-1.0)")
     
     # Reference Image & Label First
-    parser.add_argument("--reference_img_path", type=str, default="videos/reference",
+    parser.add_argument("--reference_img_path", type=str, default="reference",
                         help="Reference img file path")
-    parser.add_argument("--reference_label_path", type=str, default="videos/reference",
+    parser.add_argument("--reference_label_path", type=str, default="reference",
                         help="Reference label file path (JSON format)")
     
     # Confidence thresholds
@@ -2249,7 +2249,7 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
                          forward_cnt, backward_cnt, current_occupancy, current_congestion,
                          last_update_time, heatmap, last_save_frame, log_buffer,
                          # I/O 관련
-                         output_dir, out, log_file,
+                         output_dir, out, log_file, track_log_file, track_log_buffer,
                          # 라인 크로싱 관련
                          p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
                          width, height, output_width, output_height, scale_x, scale_y,
@@ -2343,6 +2343,57 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
                         log_file.writelines(log_buffer)
                         log_file.flush()
                         log_buffer.clear()
+
+        # 🎯 Track Result 로깅 (모든 추적된 객체의 상세 정보)
+        if track_log_file is not None and tracked_objects:
+            # ROI 접근 정보 가져오기
+            roi_access_info = {}
+            if roi_manager is not None:
+                # 각 track_id별로 ROI 접근 상태 확인
+                for roi_name, roi_stat in roi_manager.roi_stats.items():
+                    # 현재 ROI에 있는 track_id들 (confirmed + pending 모두 포함)
+                    current_tracks = set(roi_stat['current_tracks'].keys())
+                    exit_pending_tracks = set(roi_stat['exit_pending_tracks'].keys())
+                    all_roi_tracks = current_tracks.union(exit_pending_tracks)
+                    
+                    for track_id in all_roi_tracks:
+                        if track_id not in roi_access_info:
+                            roi_access_info[track_id] = {}
+                        roi_access_info[track_id][roi_name] = 1  # 접근 중
+            
+            # 모든 추적된 객체에 대해 로깅
+            for obj in tracked_objects:
+                if obj.track_id is not None and obj.track_id >= 0:
+                    # bbox를 xywh 형식으로 변환
+                    x1, y1, x2, y2 = obj.box
+                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                    w, h = x2 - x1, y2 - y1
+                    
+                    # ROI 접근 정보 문자열 생성
+                    roi_access_str = ""
+                    if roi_manager is not None:
+                        roi_values = []
+                        for roi_name in roi_manager.roi_names:
+                            access_status = 0
+                            if (obj.track_id in roi_access_info and 
+                                roi_name in roi_access_info[obj.track_id]):
+                                access_status = 1
+                            roi_values.append(str(access_status))
+                        roi_access_str = ",".join(roi_values)
+                    
+                    # 로그 엔트리 생성: frame_time,class,trackid,cx,cy,width,height,roi_access...
+                    if roi_access_str:
+                        track_log_entry = f"{time_str},{obj.class_name},{obj.track_id},{cx:.1f},{cy:.1f},{w:.1f},{h:.1f},{roi_access_str}\n"
+                    else:
+                        track_log_entry = f"{time_str},{obj.class_name},{obj.track_id},{cx:.1f},{cy:.1f},{w:.1f},{h:.1f}\n"
+                    
+                    track_log_buffer.append(track_log_entry)
+            
+            # 버퍼가 가득 차면 파일에 쓰기
+            if len(track_log_buffer) >= 100:
+                track_log_file.writelines(track_log_buffer)
+                track_log_file.flush()
+                track_log_buffer.clear()
 
         # 시각화 - 출력 해상도로 리사이즈
         frame_rgb = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
@@ -2622,10 +2673,18 @@ def main() -> None:
 
     # 로그 파일 설정
     log_file = None
+    track_log_file = None
     if args.log_detections:
         log_path = os.path.join(output_dir, "label.txt")
         log_file = open(log_path, "w", encoding="utf-8")
         log_file.write("Frame_Time,Class,TrackID,Class_Count\n")
+        
+        # 🎯 Track Result 로그 파일 설정
+        track_log_path = os.path.join(output_dir, "track_result.txt")
+        track_log_file = open(track_log_path, "w", encoding="utf-8")
+        
+        # 헤더 작성 (ROI 정보는 나중에 추가)
+        track_log_file.write("Frame_Time,Class,TrackID,cx,cy,width,height")
 
     # ─────────────── I/O setup ──────────────── #
     cap = cv2.VideoCapture(args.source)
@@ -2925,6 +2984,17 @@ def main() -> None:
     else:
         print("📍 ROI zones 미설정, ROI 기능 비활성화")
 
+    # 🎯 Track Result 로그 헤더 완성 (ROI 정보 추가)
+    track_log_buffer = []  # Track Result 로그 버퍼
+    if track_log_file is not None:
+        if roi_manager is not None:
+            # ROI 이름들을 헤더에 추가
+            for roi_name in roi_manager.roi_names:
+                track_log_file.write(f",{roi_name}")
+        track_log_file.write("\n")
+        track_log_file.flush()
+        print(f"📝 Track Result 로그 헤더 작성 완료")
+
     # 라인 깜박임 상태
     line_flash = False
 
@@ -2993,7 +3063,7 @@ def main() -> None:
                     forward_cnt, backward_cnt, current_occupancy, current_congestion,
                     last_update_time, heatmap, last_save_frame, log_buffer,
                     # I/O 관련
-                    output_dir, out, log_file,
+                    output_dir, out, log_file, track_log_file, track_log_buffer,
                     # 라인 크로싱 관련
                     p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
                     width, height, output_width, output_height, scale_x, scale_y,
@@ -3179,6 +3249,14 @@ def main() -> None:
         if log_buffer:
             log_file.writelines(log_buffer)
         log_file.close()
+    
+    # 🎯 Track Result 로그 파일 정리
+    if track_log_file is not None:
+        if track_log_buffer:
+            track_log_file.writelines(track_log_buffer)
+        track_log_file.close()
+        print(f"📝 Track Result 로그 저장 완료: track_result.txt")
+    
     out.release()
     
     print(f"\n✔ Pipeline 처리 완료! 저장 위치: {output_dir}")
