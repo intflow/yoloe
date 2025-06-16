@@ -121,8 +121,8 @@ def parse_args() -> argparse.Namespace:
                         help="YOLOE checkpoint (detection + seg)")
     # NOTE [args] text prompt
     parser.add_argument("--names", nargs="+",
-                        # default=["fish", "disco ball", "object"],
                         default=["pig", "disco ball"],
+                        # default=["object1", "object2"],
                         help="Custom class names list (index order matters)")
     # NOTE [args] GPU Device
     parser.add_argument("--device", type=str, default="cuda:0",
@@ -335,6 +335,7 @@ def load_reference_pairs_from_folder(folder_path, class_names):
             'vp_classes': [],
             'tp_classes': class_names,
             'vp_data': dict(bboxes=[], cls=[]),
+            'vp_images': [],  # 빈 리스트로 추가
             'reference_files': {}
         }
     
@@ -2753,47 +2754,50 @@ def main() -> None:
     vp_classes = reference_data['vp_classes']
     tp_classes = reference_data['tp_classes']
     vp_data = reference_data['vp_data']
-    vp_images = reference_data['vp_images']
+    vp_images = reference_data.get('vp_images', [])  # 안전하게 가져오기
     reference_files = reference_data['reference_files']
     
     # 🎨 VP 클래스들의 오버레이 이미지 생성
-    for i, (class_name, img) in enumerate(zip(vp_classes, vp_images)):
-        if class_name in reference_files:
-            # 해당 클래스의 바운딩 박스 가져오기  
-            bboxes = vp_data['bboxes'][i]
-            class_ids = vp_data['cls'][i]
-            
-            reference_overlay = img.copy()
-            
-            for j, (bbox, class_id) in enumerate(zip(bboxes, class_ids)):
-                x1, y1, x2, y2 = map(int, bbox)
+    if vp_classes and vp_images:  # VP 데이터가 있을 때만 실행
+        for i, (class_name, img) in enumerate(zip(vp_classes, vp_images)):
+            if class_name in reference_files:
+                # 해당 클래스의 바운딩 박스 가져오기  
+                bboxes = vp_data['bboxes'][i]
+                class_ids = vp_data['cls'][i]
                 
-                # 박스 그리기 (녹색)
-                cv2.rectangle(reference_overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                reference_overlay = img.copy()
                 
-                # 클래스 라벨 그리기
-                if class_id < len(args.names):
-                    class_name_label = args.names[class_id]
-                    label = f"{class_name_label} ({j+1})"
+                for j, (bbox, class_id) in enumerate(zip(bboxes, class_ids)):
+                    x1, y1, x2, y2 = map(int, bbox)
                     
-                    # 텍스트 크기 계산
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.6
-                    thickness = 2
-                    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                    # 박스 그리기 (녹색)
+                    cv2.rectangle(reference_overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     
-                    # 라벨 배경 그리기
-                    cv2.rectangle(reference_overlay, (x1, y1 - text_h - baseline - 10), 
-                                  (x1 + text_w, y1), (0, 255, 0), -1)
-                    
-                    # 텍스트 그리기
-                    cv2.putText(reference_overlay, label, (x1, y1 - baseline - 5), 
-                                font, font_scale, (255, 255, 255), thickness)
-            
-            # 오버레이된 레퍼런스 이미지 저장
-            overlay_path = os.path.join(output_dir, f"reference_overlay_{class_name}.jpg")
-            cv2.imwrite(overlay_path, reference_overlay)
-            print(f"📸 VP 오버레이 저장: {overlay_path}")
+                    # 클래스 라벨 그리기
+                    if class_id < len(args.names):
+                        class_name_label = args.names[class_id]
+                        label = f"{class_name_label} ({j+1})"
+                        
+                        # 텍스트 크기 계산
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.6
+                        thickness = 2
+                        (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                        
+                        # 라벨 배경 그리기
+                        cv2.rectangle(reference_overlay, (x1, y1 - text_h - baseline - 10), 
+                                      (x1 + text_w, y1), (0, 255, 0), -1)
+                        
+                        # 텍스트 그리기
+                        cv2.putText(reference_overlay, label, (x1, y1 - baseline - 5), 
+                                    font, font_scale, (255, 255, 255), thickness)
+                
+                # 오버레이된 레퍼런스 이미지 저장
+                overlay_path = os.path.join(output_dir, f"reference_overlay_{class_name}.jpg")
+                cv2.imwrite(overlay_path, reference_overlay)
+                print(f"📸 VP 오버레이 저장: {overlay_path}")
+    else:
+        print("📸 VP 데이터가 없어 오버레이 이미지 생성을 건너뜁니다.")
 
     # ─────────────── Model & palette ─────────── #
     # VP 모델 별도 로드
@@ -2809,7 +2813,7 @@ def main() -> None:
     # 🧠 VP & TP Embedding 추출
     final_vpe = None
     
-    if vp_classes:
+    if vp_classes and vp_images:
         print(f"\n🎯 VP Embedding 추출 중... ({len(vp_classes)}개 클래스)")
         
         # VP용 이미지들을 PIL로 변환
