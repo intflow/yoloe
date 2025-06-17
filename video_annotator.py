@@ -107,8 +107,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    parser.add_argument("--source", type=str, default="/works/ryu/10s_test.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    # parser.add_argument("--source", type=str, default="/works/ryu/10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -648,15 +648,15 @@ class ROIAccessManager:
         # 퇴장 유예 프레임 수 계산
         self.exit_grace_frames = int(exit_grace_time * fps)
         
-        # 각 ROI별 통계
+        # 각 ROI별 통계 (복합 키 사용: (class_id, track_id))
         self.roi_stats = {}
         for i, name in enumerate(roi_names):
             self.roi_stats[name] = {
                 'total_access': 0,
                 'accessed_labels': set(),
-                'track_access_count': {},  # {track_id: access_count}
-                'current_tracks': {},  # {track_id: {'enter_frame': frame, 'label': label, 'consecutive_frames': count}}
-                'exit_pending_tracks': {}  # {track_id: {'exit_frame': frame, 'grace_frames_left': count}}
+                'track_access_count': {},  # {(class_id, track_id): access_count}
+                'current_tracks': {},  # {(class_id, track_id): {'enter_frame': frame, 'label': label, 'consecutive_frames': count}}
+                'exit_pending_tracks': {}  # {(class_id, track_id): {'exit_frame': frame, 'grace_frames_left': count}}
             }
         
         print(f"\n🎯 ROI Access Manager 초기화:")
@@ -669,7 +669,7 @@ class ROIAccessManager:
         print(f"   - mask 임계값: {mask_threshold}")
     
     def update(self, tracked_objects, frame_idx, image_shape):
-        """매 프레임마다 ROI 접근 상태 업데이트"""
+        """매 프레임마다 ROI 접근 상태 업데이트 (복합 키 사용)"""
         current_frame_tracks = set()
         
         for roi_idx, (polygon, roi_name) in enumerate(zip(self.roi_polygons, self.roi_names)):
@@ -681,6 +681,9 @@ class ROIAccessManager:
                 if obj.track_id is None or obj.track_id == -1:
                     continue
                 
+                # 복합 키 생성: (class_id, track_id)
+                composite_key = (obj.class_id, obj.track_id)
+                
                 # ROI 접근 확인
                 is_in_roi = check_roi_access(
                     obj, polygon, self.detection_method,
@@ -688,59 +691,59 @@ class ROIAccessManager:
                 )
                 
                 if is_in_roi:
-                    current_roi_tracks.add(obj.track_id)
-                    current_frame_tracks.add(obj.track_id)
+                    current_roi_tracks.add(composite_key)
+                    current_frame_tracks.add(composite_key)
                     
-                    if obj.track_id in roi_stat['current_tracks']:
+                    if composite_key in roi_stat['current_tracks']:
                         # 이미 ROI에 있던 객체 → 연속 프레임 수 증가
-                        roi_stat['current_tracks'][obj.track_id]['consecutive_frames'] += 1
+                        roi_stat['current_tracks'][composite_key]['consecutive_frames'] += 1
                         
                         # 체류 시간 조건 만족 시 접근으로 카운트
-                        if (roi_stat['current_tracks'][obj.track_id]['consecutive_frames'] >= self.required_frames and
-                            not roi_stat['current_tracks'][obj.track_id].get('counted', False)):
+                        if (roi_stat['current_tracks'][composite_key]['consecutive_frames'] >= self.required_frames and
+                            not roi_stat['current_tracks'][composite_key].get('counted', False)):
                             
                             # 접근 카운트 증가
                             roi_stat['total_access'] += 1
                             roi_stat['accessed_labels'].add(obj.class_name)
                             
-                            if obj.track_id not in roi_stat['track_access_count']:
-                                roi_stat['track_access_count'][obj.track_id] = 0
-                            roi_stat['track_access_count'][obj.track_id] += 1
+                            if composite_key not in roi_stat['track_access_count']:
+                                roi_stat['track_access_count'][composite_key] = 0
+                            roi_stat['track_access_count'][composite_key] += 1
                             
                             # 중복 카운트 방지
-                            roi_stat['current_tracks'][obj.track_id]['counted'] = True
+                            roi_stat['current_tracks'][composite_key]['counted'] = True
                             
-                            # print(f"🎯 ROI 접근 감지: {roi_name} - track_id:{obj.track_id} ({obj.class_name})")
+                            # print(f"🎯 ROI 접근 감지: {roi_name} - {obj.class_name} track_id:{obj.track_id}")
                     
                     else:
                         # 새로 ROI에 진입한 객체
-                        roi_stat['current_tracks'][obj.track_id] = {
+                        roi_stat['current_tracks'][composite_key] = {
                             'enter_frame': frame_idx,
                             'label': obj.class_name,
                             'consecutive_frames': 1,
                             'counted': False
                         }
             
-            # ROI에서 나간 객체들 처리 (유예 시간 적용)
+            # ROI에서 나간 객체들 처리 (유예 시간 적용, 복합 키 사용)
             tracks_to_remove = []
             tracks_to_exit_pending = []
             
             # 1. 현재 ROI에 없는 객체들 확인
-            for track_id in roi_stat['current_tracks']:
-                if track_id not in current_roi_tracks:
+            for composite_key in roi_stat['current_tracks']:
+                if composite_key not in current_roi_tracks:
                     # 🎯 ROI에서 나간 객체 → counted=True인 객체만 퇴장 대기 상태로 이동
-                    if track_id not in roi_stat['exit_pending_tracks']:
-                        track_info = roi_stat['current_tracks'][track_id]
+                    if composite_key not in roi_stat['exit_pending_tracks']:
+                        track_info = roi_stat['current_tracks'][composite_key]
                         if track_info.get('counted', False):
                             # 접근이 확인된 객체만 퇴장 대기로 이동
-                            tracks_to_exit_pending.append(track_id)
+                            tracks_to_exit_pending.append(composite_key)
                         else:
                             # 접근 미확인 객체는 바로 제거
-                            tracks_to_remove.append(track_id)
+                            tracks_to_remove.append(composite_key)
             
             # 2. 퇴장 대기 상태로 이동
-            for track_id in tracks_to_exit_pending:
-                roi_stat['exit_pending_tracks'][track_id] = {
+            for composite_key in tracks_to_exit_pending:
+                roi_stat['exit_pending_tracks'][composite_key] = {
                     'exit_frame': frame_idx,
                     'grace_frames_left': self.exit_grace_frames
                 }
@@ -748,31 +751,33 @@ class ROIAccessManager:
             
             # 3. 퇴장 대기 중인 객체들의 유예 시간 감소
             exit_pending_to_remove = []
-            for track_id in list(roi_stat['exit_pending_tracks'].keys()):
-                if track_id in current_roi_tracks:
+            for composite_key in list(roi_stat['exit_pending_tracks'].keys()):
+                if composite_key in current_roi_tracks:
                     # 다시 ROI에 들어온 경우 → 퇴장 대기 취소
-                    del roi_stat['exit_pending_tracks'][track_id]
-                    # print(f"🔄 ROI 재진입: {roi_name} - track_id:{track_id}")
+                    del roi_stat['exit_pending_tracks'][composite_key]
+                    class_id, track_id = composite_key
+                    # print(f"🔄 ROI 재진입: {roi_name} - class_id:{class_id} track_id:{track_id}")
                 else:
                     # 여전히 ROI 밖에 있는 경우 → 유예 시간 감소
-                    roi_stat['exit_pending_tracks'][track_id]['grace_frames_left'] -= 1
+                    roi_stat['exit_pending_tracks'][composite_key]['grace_frames_left'] -= 1
                     
-                    if roi_stat['exit_pending_tracks'][track_id]['grace_frames_left'] <= 0:
+                    if roi_stat['exit_pending_tracks'][composite_key]['grace_frames_left'] <= 0:
                         # 유예 시간 만료 → 완전 제거
-                        exit_pending_to_remove.append(track_id)
-                        tracks_to_remove.append(track_id)
+                        exit_pending_to_remove.append(composite_key)
+                        tracks_to_remove.append(composite_key)
             
             # 4. 유예 시간이 만료된 객체들 완전 제거
-            for track_id in exit_pending_to_remove:
-                del roi_stat['exit_pending_tracks'][track_id]
+            for composite_key in exit_pending_to_remove:
+                del roi_stat['exit_pending_tracks'][composite_key]
             
-            for track_id in tracks_to_remove:
-                if track_id in roi_stat['current_tracks']:
-                    del roi_stat['current_tracks'][track_id]
-                    # print(f"🚪 ROI 완전 퇴장: {roi_name} - track_id:{track_id} (유예 시간 만료)")
+            for composite_key in tracks_to_remove:
+                if composite_key in roi_stat['current_tracks']:
+                    del roi_stat['current_tracks'][composite_key]
+                    class_id, track_id = composite_key
+                    # print(f"🚪 ROI 완전 퇴장: {roi_name} - class_id:{class_id} track_id:{track_id} (유예 시간 만료)")
     
     def get_current_roi_tracks(self):
-        """현재 각 ROI에 있는 track_id들 반환 (퇴장 대기 중인 객체 포함)"""
+        """현재 각 ROI에 있는 복합 키들 반환 (퇴장 대기 중인 객체 포함)"""
         current_tracks = {}
         for roi_name, roi_stat in self.roi_stats.items():
             # 현재 ROI에 있는 객체들 + 퇴장 대기 중인 객체들 (유예 기간 동안은 여전히 ROI에 있는 것으로 간주)
@@ -784,23 +789,23 @@ class ROIAccessManager:
         return current_tracks
     
     def get_roi_tracks_by_status(self):
-        """🎯 ROI 상태별 track_id들을 반환 (3단계 구분)"""
+        """🎯 ROI 상태별 복합 키들을 반환 (3단계 구분)"""
         roi_tracks_status = {}
         
         for roi_name, roi_stat in self.roi_stats.items():
-            # 각 ROI별로 상태별 track_id 분류
+            # 각 ROI별로 상태별 복합 키 분류
             pending_access = []    # 접근 확인 대기
             confirmed_access = []  # 접근 확인
             exit_pending = []      # 퇴장 대기
             
             # 1. current_tracks에서 접근 확인 대기 vs 접근 확인 구분
-            for track_id, track_info in roi_stat['current_tracks'].items():
+            for composite_key, track_info in roi_stat['current_tracks'].items():
                 if track_info.get('counted', False):
                     # 접근이 확인된 상태
-                    confirmed_access.append(track_id)
+                    confirmed_access.append(composite_key)
                 else:
                     # 아직 접근 확인 대기 상태
-                    pending_access.append(track_id)
+                    pending_access.append(composite_key)
             
             # 2. exit_pending_tracks는 모두 퇴장 대기 상태
             exit_pending = list(roi_stat['exit_pending_tracks'].keys())
@@ -814,13 +819,19 @@ class ROIAccessManager:
         return roi_tracks_status
     
     def get_statistics(self):
-        """최종 통계 반환"""
+        """최종 통계 반환 (복합 키를 문자열로 변환)"""
         stats = {}
         for roi_name, roi_stat in self.roi_stats.items():
+            # 복합 키를 문자열로 변환하여 JSON 직렬화 가능하게 만듦
+            track_access_count_str = {}
+            for (class_id, track_id), count in roi_stat['track_access_count'].items():
+                key_str = f"class_{class_id}_track_{track_id}"
+                track_access_count_str[key_str] = count
+            
             stats[roi_name] = {
                 'total_access': roi_stat['total_access'],
                 'accessed_labels': list(roi_stat['accessed_labels']),
-                'track_access_count': dict(roi_stat['track_access_count'])
+                'track_access_count': track_access_count_str
             }
         return stats
     
@@ -853,7 +864,7 @@ class ROIAccessManager:
             print(f"💥 ROI 통계 저장 실패: {e}")
     
     def print_final_statistics(self):
-        """최종 통계를 콘솔에 출력"""
+        """최종 통계를 콘솔에 출력 (복합 키 기반)"""
         print(f"\n🎯 ROI 접근 감지 최종 통계:")
         print(f"{'='*50}")
         
@@ -865,8 +876,8 @@ class ROIAccessManager:
             
             if roi_stat['track_access_count']:
                 print(f"   Track ID별 접근 횟수:")
-                for track_id, count in sorted(roi_stat['track_access_count'].items()):
-                    print(f"     - Track {track_id}: {count}회")
+                for (class_id, track_id), count in sorted(roi_stat['track_access_count'].items()):
+                    print(f"     - Class {class_id} Track {track_id}: {count}회")
             
             if not roi_stat['total_access']:
                 print(f"   접근 기록 없음")
@@ -933,28 +944,31 @@ def draw_roi_polygons(image, roi_polygons, roi_names, roi_stats):
     return image
 
 def highlight_roi_objects(image, tracked_objects, roi_tracks_status, color_palette):
-    """🎯 ROI 상태별로 객체들을 하이라이트 (3단계 구분)"""
+    """🎯 ROI 상태별로 객체들을 하이라이트 (3단계 구분, 복합 키 기반)"""
     
-    # 모든 ROI의 상태별 track_id들 수집
-    confirmed_track_ids = set()  # 접근 확인 (빨간색 실선)
-    pending_track_ids = set()    # 접근 확인 대기 + 퇴장 대기 (빨간색 점선)
+    # 모든 ROI의 상태별 복합 키들 수집
+    confirmed_composite_keys = set()  # 접근 확인 (빨간색 실선)
+    pending_composite_keys = set()    # 접근 확인 대기 + 퇴장 대기 (빨간색 점선)
     
     for roi_name, status_dict in roi_tracks_status.items():
-        confirmed_track_ids.update(status_dict['confirmed_access'])
-        pending_track_ids.update(status_dict['pending_access'])
-        pending_track_ids.update(status_dict['exit_pending'])
+        confirmed_composite_keys.update(status_dict['confirmed_access'])
+        pending_composite_keys.update(status_dict['pending_access'])
+        pending_composite_keys.update(status_dict['exit_pending'])
     
     # 빨간색 정의
     red_color = (255, 0, 0)  # BGR 형식
     thickness = 4
     
     for obj in tracked_objects:
-        if obj.track_id in confirmed_track_ids:
+        # 객체의 복합 키 생성
+        obj_composite_key = (obj.class_id, obj.track_id)
+        
+        if obj_composite_key in confirmed_composite_keys:
             # 접근 확인된 객체 → 빨간색 실선 테두리
             x1, y1, x2, y2 = map(int, obj.box)
             cv2.rectangle(image, (x1-2, y1-2), (x2+2, y2+2), red_color, thickness)
             
-        elif obj.track_id in pending_track_ids:
+        elif obj_composite_key in pending_composite_keys:
             # 접근 확인 대기 또는 퇴장 대기 객체 → 빨간색 점선 테두리
             x1, y1, x2, y2 = map(int, obj.box)
             draw_dashed_rectangle(image, (x1-2, y1-2), (x2+2, y2+2), red_color, thickness)
@@ -2349,20 +2363,20 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
 
         # 🎯 Track Result 로깅 (모든 추적된 객체의 상세 정보)
         if track_log_file is not None and tracked_objects:
-            # ROI 접근 정보 가져오기
+            # ROI 접근 정보 가져오기 (복합 키 기반)
             roi_access_info = {}
             if roi_manager is not None:
-                # 각 track_id별로 ROI 접근 상태 확인
+                # 각 복합 키별로 ROI 접근 상태 확인
                 for roi_name, roi_stat in roi_manager.roi_stats.items():
-                    # 현재 ROI에 있는 track_id들 (confirmed + pending 모두 포함)
+                    # 현재 ROI에 있는 복합 키들 (confirmed + pending 모두 포함)
                     current_tracks = set(roi_stat['current_tracks'].keys())
                     exit_pending_tracks = set(roi_stat['exit_pending_tracks'].keys())
                     all_roi_tracks = current_tracks.union(exit_pending_tracks)
                     
-                    for track_id in all_roi_tracks:
-                        if track_id not in roi_access_info:
-                            roi_access_info[track_id] = {}
-                        roi_access_info[track_id][roi_name] = 1  # 접근 중
+                    for composite_key in all_roi_tracks:
+                        if composite_key not in roi_access_info:
+                            roi_access_info[composite_key] = {}
+                        roi_access_info[composite_key][roi_name] = 1  # 접근 중
             
             # 모든 추적된 객체에 대해 로깅
             for obj in tracked_objects:
@@ -2372,10 +2386,11 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
                     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                     w, h = x2 - x1, y2 - y1
                     
-                    # ROI 접근 정보 문자열 생성
+                    # ROI 접근 정보 문자열 생성 (복합 키 기반)
                     roi_access_str = ""
                     if roi_manager is not None:
                         roi_values = []
+                        obj_composite_key = (obj.class_id, obj.track_id)
                         for roi_name in roi_manager.roi_names:
                             access_status = 0
                             if (obj.track_id in roi_access_info and 
