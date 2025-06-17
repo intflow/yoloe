@@ -213,8 +213,8 @@ class BoostTrack(object):
         self.lost_trackers_by_class = {}  # lost된 tracker들
         
         # Tentative 모드 설정
-        self.probation_age = 100  # 수습 기간 (프레임)
-        self.early_termination_age = 6  # 조기 제거 기간
+        self.probation_age = 30  # 수습 기간 (프레임)
+        self.early_termination_age = 2  # 조기 제거 기간
         self.max_num_tracks = max_num_tracks  # 최대 추적 수 (None이면 무제한)
 
         # max_age 설정: 초 단위를 프레임 단위로 변환

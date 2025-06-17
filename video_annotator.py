@@ -1072,6 +1072,9 @@ def draw_detection_area(image, detection_area_polygon, scale_x=1.0, scale_y=1.0)
 def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=None, args=None) -> list[ObjectMeta]:
     """
     CPU로 변환된 YOLO 결과를 ObjectMeta 리스트로 변환
+    
+    주의: 기본 감지 영역 필터링은 _filter_detections에서 처리됩니다.
+    
     Confidence 기준에 따른 클래스 할당:
     - conf >= 0.1: 정상적인 클래스 부여
     - 0.01 <= conf < 0.1: 'object' 클래스로 부여
@@ -1080,10 +1083,9 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
     global _debug_frame_count, _max_debug_frames
     
     objects = []
-    filtered_count = 0  # 필터링된 객체 수 (통계용)
     
     if not cpu_result['has_boxes']:
-        return objects, filtered_count
+        return objects
     
     boxes = cpu_result['boxes_xyxy']  # 이미 CPU numpy array
     confidences = cpu_result['boxes_conf']  # 이미 CPU numpy array
@@ -1232,15 +1234,7 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
     # 디버그 카운터 증가
     _debug_frame_count += 1
 
-    # 🎯 기본 감지 영역 필터링된 objects를 정리해서 반환
-    filtered_objects = []
-    for obj in objects:
-        if detection_area_polygon is None or is_bbox_center_in_polygon(obj.box, detection_area_polygon):
-            filtered_objects.append(obj)  # 조건 만족시에만 추가
-        else:
-            filtered_count += 1  # 필터링된 객체 수 증가
-    
-    return filtered_objects, filtered_count
+    return objects
 
 
 # ─────────────────────── Direct Overlay Functions ────────────────────────────── #
@@ -1520,8 +1514,7 @@ class InferenceThread(threading.Thread):
             'total_batches_processed': 0,
             'total_frames_processed': 0,
             'vpe_updates': 0,
-            'failed_batches': 0,
-            'filtered_objects': 0  # 필터링된 객체 수 통계 추가
+            'failed_batches': 0
         }
         
         print(f"\n🧠 Inference Thread 초기화:")
@@ -1582,6 +1575,9 @@ class InferenceThread(threading.Thread):
                         self.stats['failed_batches'] += 1
                         continue
                     
+                    # 🔥 ──────── OVERLAPPING DETECTION FILTERING ──────── #
+                    batch_results = self._filter_detections(batch_results)
+                    
                     # ──────── VPE UPDATE ──────── #
                     vpe_updated = False
                     if self.args.cross_vp:
@@ -1592,13 +1588,10 @@ class InferenceThread(threading.Thread):
                     batch_original_frames = []   # 원본 프레임들
                     
                     for cpu_result in batch_results:
-                        # 🎯 cpu_result → ObjectMeta 변환 + 기본 감지 영역 필터링
-                        detected_objects, filtered_count = convert_results_to_objects(
+                        # 🎯 cpu_result → ObjectMeta 변환 (기본 감지 영역 필터링은 _filter_detections에서 처리됨)
+                        detected_objects = convert_results_to_objects(
                             cpu_result, self.args.names, self.detection_area_polygon, self.args
                         )
-                        
-                        # 필터링 통계 업데이트
-                        self.stats['filtered_objects'] += filtered_count
                         
                         batch_detected_objects.append(detected_objects)
                         batch_original_frames.append(cpu_result['orig_img'])
@@ -1667,7 +1660,8 @@ class InferenceThread(threading.Thread):
             print(f"   - VPE 업데이트 횟수: {self.stats['vpe_updates']}")
             print(f"   - VPE 업데이트 epoch: {self.vpe_update_epoch}")
             print(f"   - 실패한 배치 수: {self.stats['failed_batches']}")
-            print(f"   - 기본 감지 영역에서 필터링된 객체 수: {self.stats['filtered_objects']}")
+            print(f"   - 오탐 필터링된 큰 bbox 수: {self.stats.get('overlapping_filtered', 0)}")
+            print(f"   - 기본 감지 영역에서 필터링된 객체 수: {self.stats.get('detection_area_filtered', 0)}")
             print("🚀 GPU 메모리 완전 정리 완료!")
     
     def _inference_batch(self, batch_frames):
@@ -1884,8 +1878,164 @@ class InferenceThread(threading.Thread):
             torch.cuda.empty_cache()
             return None
     
-
-    
+    # ANCHOR Filtering Batch Results Functions
+    def _filter_detections(self, batch_results):
+        """
+        🔥 통합 필터링: 오탐 큰 bbox + 기본 감지 영역 (단일 루프로 효율적 처리)
+        
+        각 객체별로 다음 순서로 필터링:
+        1. 기본 감지 영역 체크 (설정된 경우): bbox 중심점이 영역 밖이면 제거
+        2. 오탐 큰 bbox 체크: 작은 객체들을 포함하는 큰 객체 제거
+           - 같은 class_id를 가진 다른 객체가 존재
+           - 다른 객체의 bbox가 자신의 bbox 안에 들어와 있음  
+           - 다른 객체 bbox의 90% 이상이 자신의 bbox 안에 포함됨
+           - 다른 객체의 bbox 넓이가 자신의 bbox 넓이의 0.5 이하
+        
+        Args:
+            batch_results: GPU에서 CPU로 변환된 추론 결과 리스트
+            
+        Returns:
+            filtered_batch_results: 필터링된 추론 결과 리스트
+        """
+        filtered_batch_results = []
+        total_overlapping_filtered = 0
+        total_detection_area_filtered = 0
+        
+        for frame_idx, cpu_result in enumerate(batch_results):
+            if not cpu_result['has_boxes']:
+                # 박스가 없으면 그대로 추가
+                filtered_batch_results.append(cpu_result)
+                continue
+            
+            boxes = cpu_result['boxes_xyxy']  # [N, 4] (x1, y1, x2, y2)
+            confidences = cpu_result['boxes_conf']  # [N]
+            class_ids = cpu_result['boxes_cls']  # [N]
+            
+            if len(boxes) <= 1:
+                # 객체가 1개 이하면 필터링 불필요
+                filtered_batch_results.append(cpu_result)
+                continue
+            
+            # 필터링할 인덱스들 수집 (오탐 + 감지영역 통합)
+            indices_to_remove = set()
+            
+            for i in range(len(boxes)):
+                if i in indices_to_remove:
+                    continue
+                    
+                bbox_i = boxes[i]  # [x1, y1, x2, y2]
+                class_i = class_ids[i]
+                conf_i = confidences[i]
+                
+                # ANCHOR 기본 감지 영역 필터링 체크 (설정된 경우만)
+                if self.detection_area_polygon is not None:
+                    if not is_bbox_center_in_polygon(bbox_i, self.detection_area_polygon):
+                        indices_to_remove.add(i)
+                        total_detection_area_filtered += 1
+                        continue  # 감지 영역 밖이면 오탐 검사 불필요
+                    
+                # conf 0.1 이하인 경우만 체크
+                if conf_i >= 0.1:
+                    continue
+                
+                # 🔥 오탐 필터링: 다른 객체들과 겹침 확인
+                area_i = (bbox_i[2] - bbox_i[0]) * (bbox_i[3] - bbox_i[1])
+                
+                for j in range(len(boxes)):
+                    if i == j or j in indices_to_remove:
+                        continue
+                    
+                    bbox_j = boxes[j]  # [x1, y1, x2, y2]
+                    class_j = class_ids[j]
+                    area_j = (bbox_j[2] - bbox_j[0]) * (bbox_j[3] - bbox_j[1])
+                    
+                    # 조건 1: 같은 클래스인지 확인
+                    if class_i != class_j:
+                        continue
+                    
+                    # 조건 4: bbox_j의 넓이가 bbox_i 넓이의 0.5 이하인지 확인
+                    if area_j > area_i * 0.5:
+                        continue
+                    
+                    # 조건 2, 3: bbox_j가 bbox_i 안에 90% 이상 포함되는지 확인
+                    # bbox_j와 bbox_i의 교집합 계산
+                    intersect_x1 = max(bbox_i[0], bbox_j[0])
+                    intersect_y1 = max(bbox_i[1], bbox_j[1])
+                    intersect_x2 = min(bbox_i[2], bbox_j[2])
+                    intersect_y2 = min(bbox_i[3], bbox_j[3])
+                    
+                    # 교집합이 존재하는지 확인
+                    if intersect_x1 >= intersect_x2 or intersect_y1 >= intersect_y2:
+                        continue  # 교집합 없음
+                    
+                    # 교집합 넓이 계산
+                    intersect_area = (intersect_x2 - intersect_x1) * (intersect_y2 - intersect_y1)
+                    
+                    # bbox_j의 90% 이상이 bbox_i 안에 포함되는지 확인
+                    overlap_ratio = intersect_area / area_j if area_j > 0 else 0
+                    
+                    if overlap_ratio >= 0.95:
+                        # 🎯 모든 조건 만족 → bbox_i를 제거 대상으로 마킹
+                        indices_to_remove.add(i)
+                        total_overlapping_filtered += 1
+                        # print(f"🗑️ 오탐 필터링: 프레임 {frame_idx}, bbox {i} 제거 "
+                        #       f"(class={class_i}, area_ratio={area_j/area_i:.3f}, overlap_ratio={overlap_ratio:.3f})")
+                        break  # 하나라도 조건 만족하면 제거
+            
+            # 필터링된 결과 생성 (오탐 + 감지영역 통합 필터링)
+            if indices_to_remove:
+                # 제거할 인덱스가 있으면 필터링
+                keep_indices = [i for i in range(len(boxes)) if i not in indices_to_remove]
+                
+                if keep_indices:
+                    # 남은 객체들로 새로운 cpu_result 생성
+                    filtered_cpu_result = cpu_result.copy()
+                    filtered_cpu_result['boxes_xyxy'] = boxes[keep_indices]
+                    filtered_cpu_result['boxes_conf'] = confidences[keep_indices]
+                    filtered_cpu_result['boxes_cls'] = class_ids[keep_indices]
+                    filtered_cpu_result['has_boxes'] = len(keep_indices) > 0
+                    
+                    # 마스크 정보도 필터링 (있는 경우)
+                    if cpu_result['masks_type'] == 'xy' and 'masks_xy' in cpu_result:
+                        filtered_cpu_result['masks_xy'] = [cpu_result['masks_xy'][i] for i in keep_indices]
+                    elif cpu_result['masks_type'] == 'data' and 'masks_data' in cpu_result:
+                        filtered_cpu_result['masks_data'] = cpu_result['masks_data'][keep_indices]
+                    
+                    filtered_batch_results.append(filtered_cpu_result)
+                else:
+                    # 모든 객체가 제거된 경우 빈 결과 생성
+                    empty_cpu_result = cpu_result.copy()
+                    empty_cpu_result['boxes_xyxy'] = np.empty((0, 4))
+                    empty_cpu_result['boxes_conf'] = np.empty(0)
+                    empty_cpu_result['boxes_cls'] = np.empty(0, dtype=int)
+                    empty_cpu_result['has_boxes'] = False
+                    empty_cpu_result['masks_type'] = None
+                    filtered_batch_results.append(empty_cpu_result)
+            else:
+                # 제거할 객체가 없으면 원본 그대로
+                filtered_batch_results.append(cpu_result)
+        
+        # 통계 업데이트
+        if total_overlapping_filtered > 0:
+            if not hasattr(self.stats, 'overlapping_filtered'):
+                self.stats['overlapping_filtered'] = 0
+            self.stats['overlapping_filtered'] += total_overlapping_filtered
+        
+        if total_detection_area_filtered > 0:
+            if not hasattr(self.stats, 'detection_area_filtered'):
+                self.stats['detection_area_filtered'] = 0
+            self.stats['detection_area_filtered'] += total_detection_area_filtered
+        
+        # 디버깅 출력
+        if total_overlapping_filtered > 0 or total_detection_area_filtered > 0:
+            debug_msg = "🔥 필터링 완료:"
+            if total_overlapping_filtered > 0:
+                debug_msg += f" 오탐 {total_overlapping_filtered}개"
+            if total_detection_area_filtered > 0:
+                debug_msg += f" 감지영역외 {total_detection_area_filtered}개"
+            # print(debug_msg)
+        
+        return filtered_batch_results
 
 
 
@@ -3246,7 +3396,8 @@ def main() -> None:
         print(f"   - 처리된 프레임 수: {inference_stats['total_frames_processed']}")
         print(f"   - VPE 업데이트 횟수: {inference_stats['vpe_updates']}")
         print(f"   - 실패한 배치 수: {inference_stats['failed_batches']}")
-        print(f"   - 기본 감지 영역 필터링된 객체 수: {inference_stats['filtered_objects']}")
+        print(f"   - 오탐 필터링된 큰 bbox 수: {inference_stats.get('overlapping_filtered', 0)}")
+        print(f"   - 기본 감지 영역에서 필터링된 객체 수: {inference_stats.get('detection_area_filtered', 0)}")
         
         # GPU 효율성 계산
         if inference_stats['total_batches_processed'] > 0:
