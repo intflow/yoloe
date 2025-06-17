@@ -107,8 +107,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    # parser.add_argument("--source", type=str, default="/works/ryu/10s_test.mp4",
+    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    parser.add_argument("--source", type=str, default="/works/ryu/10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")

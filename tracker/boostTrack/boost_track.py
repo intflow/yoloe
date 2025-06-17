@@ -724,19 +724,23 @@ class BoostTrack(object):
         # ═══════════════════════════════════════════════════════════════════
         tracked_objects = []
         
-        # 모든 input objects에 대해 tracker ID 매핑 생성
+        # 모든 input objects에 대해 (class_id, track_id) 복합 키로 매핑 생성
         id_to_object = {}
         for obj in objects:
             if hasattr(obj, 'track_id') and obj.track_id is not None:
-                id_to_object[obj.track_id] = obj
+                # 클래스별 독립적 ID를 위해 (class_id, track_id) 복합 키 사용
+                composite_key = (obj.class_id, obj.track_id)
+                id_to_object[composite_key] = obj
         
         # self.trackers_by_class에 있는 activated tracker들만 최종 결과에 포함 (C++과 동일)
-        for cls_trackers in self.trackers_by_class.values():
+        for cls, cls_trackers in self.trackers_by_class.items():
             for tracker in cls_trackers:
                 if tracker.is_activated and (tracker.time_since_update < 1) and \
                    (tracker.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
-                    if tracker.id in id_to_object:
-                        tracked_objects.append(id_to_object[tracker.id])
+                    # 클래스별 독립적 ID를 위해 (class_id, track_id) 복합 키 사용
+                    composite_key = (int(cls), tracker.id)
+                    if composite_key in id_to_object:
+                        tracked_objects.append(id_to_object[composite_key])
 
         return tracked_objects
 
