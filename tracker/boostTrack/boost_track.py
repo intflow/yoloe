@@ -174,6 +174,23 @@ class KalmanBoxTracker(object):
         self.state = "Tracked"
         self.is_activated = True
         
+    def re_match(self, new_tracker, frame_count):
+        """lost tracker와 tentative tracker를 병합 (C++ re_match와 동일)"""
+        # C++과 동일: Kalman filter 업데이트 대신 새 tracker의 상태를 직접 복사
+        self.kf.x = new_tracker.kf.x.copy()
+        self.kf.covariance = new_tracker.kf.covariance.copy()
+        
+        # 상태 정보 업데이트
+        self.state = "Tracked"
+        self.is_activated = True
+        
+        # 새 tracker의 속성들 복사 (C++과 동일)
+        # score, emb 등의 정보도 새 tracker에서 가져옴
+        if hasattr(new_tracker, 'emb') and new_tracker.emb is not None:
+            self.emb = new_tracker.emb.copy()
+        
+        self.age = frame_count  # frame_id 업데이트
+        
     def tentative_init(self, frame_count):
         """tentative 모드로 초기화"""
         self.start_frame = frame_count
@@ -182,7 +199,7 @@ class KalmanBoxTracker(object):
 
 
 class BoostTrack(object):
-    def __init__(self, video_name: Optional[str] = None, det_thresh: Optional[float] = None, iou_threshold: Optional[float] = None, max_num_tracks: Optional[int] = None):
+    def __init__(self, video_name: Optional[str] = None, det_thresh: Optional[float] = None, iou_threshold: Optional[float] = None, max_num_tracks: Optional[int] = None, max_age_sec: Optional[float] = None, fps: Optional[float] = None):
         self.frame_count = 0
         self.trackers: List[KalmanBoxTracker] = []
         self.trackers_by_class = {}  # Dictionary to store trackers by class
@@ -196,11 +213,15 @@ class BoostTrack(object):
         self.lost_trackers_by_class = {}  # lost된 tracker들
         
         # Tentative 모드 설정
-        self.probation_age = 3  # 수습 기간 (프레임)
-        self.early_termination_age = 1  # 조기 제거 기간
+        self.probation_age = 100  # 수습 기간 (프레임)
+        self.early_termination_age = 6  # 조기 제거 기간
         self.max_num_tracks = max_num_tracks  # 최대 추적 수 (None이면 무제한)
 
-        self.max_age = GeneralSettings.max_age(video_name)
+        # max_age 설정: 초 단위를 프레임 단위로 변환
+        if max_age_sec is not None and fps is not None:
+            self.max_age = int(max_age_sec * fps)  # 초 * fps = 프레임
+        else:
+            self.max_age = GeneralSettings.max_age(video_name)  # 기본값 사용
         # CLI 파라미터가 있으면 사용, 없으면 기본값 사용
         self.iou_threshold = iou_threshold if iou_threshold is not None else GeneralSettings['iou_threshold']
         self.det_thresh = det_thresh if det_thresh is not None else GeneralSettings['det_thresh']
@@ -602,22 +623,21 @@ class BoostTrack(object):
                         diou_distances, threshold=999999.0
                     )
                     
-                    # Re-matching 처리 - 임시 리스트에 추가
+                    # Re-matching 처리 - 임시 리스트에 추가 (C++과 동일한 re_match 사용)
                     for match in rematches:
                         lost_idx, new_idx = match[0], match[1]
                         lost_tracker = already_lost_stracks[lost_idx]
                         new_tracker = to_activate_tracks[new_idx]
                         
-                        # lost tracker 재활성화
-                        new_bbox = new_tracker.get_state()[0]
-                        lost_tracker.re_activate(new_bbox, new_tracker.kf.x[4] if len(new_tracker.kf.x) > 4 else 0.5, self.frame_count)
+                        # lost tracker와 tentative tracker 병합 (C++ re_match와 동일)
+                        lost_tracker.re_match(new_tracker, self.frame_count)
                         
                         # rematched_stracks에 추가
                         if cls not in rematched_trackers_by_class:
                             rematched_trackers_by_class[cls] = []
                         rematched_trackers_by_class[cls].append(lost_tracker)
                         
-                        # new tracker 제거 표시
+                        # new tracker 제거 표시 (C++과 동일)
                         new_tracker.state = "Removed"
                     
                     # 매칭안된 새 tracker들 활성화 - activated_stracks에 추가

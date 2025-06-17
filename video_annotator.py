@@ -144,6 +144,8 @@ def parse_args() -> argparse.Namespace:
                         help="Detection confidence threshold for tracking")
     parser.add_argument("--track-iou-thresh", type=float, default=0.5,
                         help="Tracking IoU threshold")
+    parser.add_argument("--max-age-sec", type=float, default=3600,
+                        help="Maximum age for lost trackers in seconds (converted to frames using fps)")
     # Congestion / counting
     parser.add_argument("--max-people", type=int, default=100,
                         help="People count that corresponds to 100 percent congestion")
@@ -2918,7 +2920,9 @@ def main() -> None:
     tracker = BoostTrack(
         video_name=args.source,
         det_thresh=args.track_det_thresh,
-        iou_threshold=args.track_iou_thresh
+        iou_threshold=args.track_iou_thresh,
+        max_age_sec=args.max_age_sec,
+        fps=fps
     )
 
     # ─────────────── Counting line (pixel) ───── #
