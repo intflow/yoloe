@@ -107,8 +107,8 @@ class ObjectMeta:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # NOTE [args] source & output
-    # parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
-    parser.add_argument("--source", type=str, default="/works/ryu/10s_test.mp4",
+    parser.add_argument("--source", type=str, default="/DL_data_super_hdd/video_label_sandbox/efg_cargil2025_test1.mp4",
+    # parser.add_argument("--source", type=str, default="/works/ryu/10s_test.mp4",
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
@@ -1204,14 +1204,14 @@ def convert_results_to_objects(cpu_result, class_names, detection_area_polygon=N
         obj.original_class_id = original_class_id
         objects.append(obj)
     
-            # 최종 할당 결과 출력 (디버깅 프레임에서만)
-        if should_debug and len(objects) > 0:
-            print(f"✅ 클래스 할당 완료 (원본 클래스 유지):")
-            print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {high_conf_assigned}개")
-            print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {medium_conf_assigned}개") 
-            print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {low_conf_assigned}개 (원본 클래스 유지)")
-            print(f"   - 총 할당된 객체: {len(objects)}개")
-            print("-" * 50)
+    # 최종 할당 결과 출력 (디버깅 프레임에서만)
+    if should_debug and len(objects) > 0:
+        print(f"✅ 클래스 할당 완료 (원본 클래스 유지):")
+        print(f"   - 고신뢰도 (≥{args.high_conf_thresh}): {high_conf_assigned}개")
+        print(f"   - 중신뢰도 ({args.medium_conf_thresh}~{args.high_conf_thresh}): {medium_conf_assigned}개") 
+        print(f"   - 저신뢰도 ({args.very_low_conf_thresh}~{args.medium_conf_thresh}): {low_conf_assigned}개 (원본 클래스 유지)")
+        print(f"   - 총 할당된 객체: {len(objects)}개")
+        print("-" * 50)
     
     # 디버그 카운터 증가
     _debug_frame_count += 1
@@ -1761,7 +1761,7 @@ class InferenceThread(threading.Thread):
                     # Moving Average with dynamic learning rate
                     self.prev_vpe = (1 - learning_rate) * self.prev_vpe + learning_rate * current_vpe
                     
-                    print(f"🔄 VPE 점진적 업데이트 완료 (epoch: {self.vpe_update_epoch}, lr: {learning_rate:.4f})")
+                    # print(f"🔄 VPE 점진적 업데이트 완료 (epoch: {self.vpe_update_epoch}, lr: {learning_rate:.4f})")
                 return True
             else:
                 return False
@@ -1801,8 +1801,8 @@ class InferenceThread(threading.Thread):
             
             # 통계 출력
             total_count = len(all_prompts)
-            if total_count > 0:
-                print(f"🎯 VPE 업데이트: 전체 유효 detection {total_count}개 프레임 (≥0.01)")
+            # if total_count > 0:
+            #     print(f"🎯 VPE 업데이트: 전체 유효 detection {total_count}개 프레임 (≥0.01)")
             
             return batch_vpe
         else:

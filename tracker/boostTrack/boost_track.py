@@ -53,10 +53,7 @@ class KalmanBoxTracker(object):
     This class represents the internal state of individual tracked objects observed as bbox.
     """
 
-    count = 0  # 정식 tracker용 counter (양수 ID)
-    tentative_count = 0  # tentative tracker용 counter (음수 ID)
-
-    def __init__(self, bbox, emb: Optional[np.ndarray] = None, is_tentative: bool = False):
+    def __init__(self, bbox, emb: Optional[np.ndarray] = None, is_tentative: bool = False, class_id: int = 0, id_counter_callback=None):
         """
         Initialises a tracker using initial bounding box.
         """
@@ -65,16 +62,20 @@ class KalmanBoxTracker(object):
         self.x_to_bbox_func = convert_x_to_bbox
 
         self.time_since_update = 0
+        self.class_id = class_id
         
         # ID 할당 - tentative와 confirmed 완전히 분리
-        if is_tentative:
-            KalmanBoxTracker.tentative_count += 1
-            self.id = -KalmanBoxTracker.tentative_count  # 음수 ID
-            self.is_tentative_id = True
+        if id_counter_callback:
+            self.id = id_counter_callback(class_id, is_tentative)
+            self.is_tentative_id = is_tentative
         else:
-            KalmanBoxTracker.count += 1
-            self.id = KalmanBoxTracker.count  # 양수 ID
-            self.is_tentative_id = False
+            # 기본 전역 카운터 (하위 호환성)
+            if is_tentative:
+                self.id = -1  # 기본 tentative ID
+                self.is_tentative_id = True
+            else:
+                self.id = 1  # 기본 confirmed ID
+                self.is_tentative_id = False
 
         self.kf = KalmanFilter(self.bbox_to_z_func(bbox))
         self.emb = emb
@@ -130,19 +131,33 @@ class KalmanBoxTracker(object):
         return self.x_to_bbox_func(self.kf.x)
 
     def update_emb(self, emb, alpha=0.9):
-        self.emb = alpha * self.emb + (1 - alpha) * emb
+        if self.emb is None:
+            self.emb = emb
+        else:
+            self.emb = alpha * self.emb + (1 - alpha) * emb
         self.emb /= np.linalg.norm(self.emb)
 
     def get_emb(self):
         return self.emb
     
-    def activate(self, frame_count):
+    @property
+    def end_frame(self):
+        """현재 프레임 ID 반환 (C++ end_frame()과 동일)"""
+        return self.age
+    
+    def mark_removed(self):
+        """tracker를 removed 상태로 변경"""
+        self.state = "Removed"
+    
+    def activate(self, frame_count, id_counter_callback=None):
         """tracker를 정식 활성화"""
         # tentative tracker였다면 새로운 confirmed ID 할당
         if self.is_tentative_id:
-            KalmanBoxTracker.count += 1
             old_id = self.id
-            self.id = KalmanBoxTracker.count  # 새로운 양수 ID
+            if id_counter_callback:
+                self.id = id_counter_callback(self.class_id, False)  # confirmed ID 요청
+            else:
+                self.id = 1  # 기본값
             self.is_tentative_id = False
             # print(f"[ID 승격] Tentative ID {old_id} → Confirmed ID {self.id}")
         
@@ -171,6 +186,10 @@ class BoostTrack(object):
         self.frame_count = 0
         self.trackers: List[KalmanBoxTracker] = []
         self.trackers_by_class = {}  # Dictionary to store trackers by class
+        
+        # 클래스별 ID 카운터
+        self.count_by_class = {}  # 정식 tracker용 counter (양수 ID)
+        self.tentative_count_by_class = {}  # tentative tracker용 counter (음수 ID)
         
         # Tentative 모드를 위한 컨테이너들
         self.tentative_trackers_by_class = {}  # 수습 중인 tracker들
@@ -209,33 +228,81 @@ class BoostTrack(object):
         else:
             self.ecc = None
 
+    def get_next_id(self, class_id: int, is_tentative: bool) -> int:
+        """클래스별로 독립적인 ID 생성"""
+        if is_tentative:
+            if class_id not in self.tentative_count_by_class:
+                self.tentative_count_by_class[class_id] = 0
+            self.tentative_count_by_class[class_id] += 1
+            return -self.tentative_count_by_class[class_id]  # 음수 ID
+        else:
+            if class_id not in self.count_by_class:
+                self.count_by_class[class_id] = 0
+            self.count_by_class[class_id] += 1
+            return self.count_by_class[class_id]  # 양수 ID
+
+    def joint_stracks(self, tlista, tlistb):
+        """두 tracker 리스트를 합치되 중복 제거 (C++ joint_stracks와 동일)"""
+        exists = {}
+        res = []
+        for t in tlista:
+            exists[t.id] = 1
+            res.append(t)
+        for t in tlistb:
+            tid = t.id
+            if not exists.get(tid, 0):
+                exists[tid] = 1
+                res.append(t)
+        return res
+
+    def sub_stracks(self, tlista, tlistb):
+        """tlista에서 tlistb에 있는 tracker들 제거 (C++ sub_stracks와 동일)"""
+        stracks = {}
+        for t in tlista:
+            stracks[t.id] = t
+        for t in tlistb:
+            tid = t.id
+            if stracks.get(tid, 0):
+                del stracks[tid]
+        return list(stracks.values())
+
     def update(self, objects, img_numpy, tag):
         """
         ObjectMeta 리스트를 받아서 tracking하고 track_id를 부여하여 반환
-        1. 정상 confidence (>= 0.1) 객체들끼리 클래스별 매칭
-        2. 매칭되지 않은 tracker들과 저신뢰도 객체들을 매칭
+        C++ tracker_ref.cpp의 정확한 순서를 따름 (임시 리스트 시스템 사용)
         """
         if not objects:
             return []
 
         self.frame_count += 1
 
-        # 객체들 분리 및 numpy 배열 생성을 한 번에 처리
-        normal_objects = []
-        low_conf_objects = []
-        normal_dets = []
+        # ═══════════════════════════════════════════════════════════════════
+        # 임시 리스트들 선언 (C++의 activated_stracks, lost_stracks 등과 동일)
+        # ═══════════════════════════════════════════════════════════════════
+        activated_trackers_by_class = {}  # activated_stracks
+        lost_trackers_by_class = {}       # lost_stracks  
+        refind_trackers_by_class = {}     # refind_stracks
+        rematched_trackers_by_class = {}  # rematched_stracks
+        tentative_trackers_by_class = {}  # tentative_stracks
+        removed_trackers_by_class = {}    # removed_stracks
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ANCHOR Step 1: Get detections - 객체들 분리 및 numpy 배열 생성
+        # ═══════════════════════════════════════════════════════════════════
+        high_conf_objects = []  # >= 0.1 (track_thresh)
+        low_conf_objects = []   # 0.01 ~ 0.1
+        high_conf_dets = []
         
         for obj in objects:
-            if obj.confidence >= 0.1:
-                normal_objects.append(obj)
+            if obj.confidence >= 0.1:  # track_thresh
+                high_conf_objects.append(obj)
                 x1, y1, x2, y2 = obj.box
                 det = [x1, y1, x2, y2, obj.confidence, obj.class_id]
-                normal_dets.append(det)
+                high_conf_dets.append(det)
             elif 0.01 <= obj.confidence < 0.1:
                 low_conf_objects.append(obj)
         
-        # numpy 배열로 변환
-        normal_dets = np.array(normal_dets) if normal_dets else np.empty((0, 6))
+        high_conf_dets = np.array(high_conf_dets) if high_conf_dets else np.empty((0, 6))
 
         if self.ecc is not None:
             transform = self.ecc(img_numpy, self.frame_count, tag)
@@ -243,438 +310,494 @@ class BoostTrack(object):
                 for trk in cls_trackers:
                     trk.camera_update(transform)
 
-        tracked_objects = []
-        unmatched_trackers_info = []  # 매칭되지 않은 tracker들 정보 저장
-
         # ═══════════════════════════════════════════════════════════════════
-        # 단계 1: 정상 confidence 객체들끼리 클래스별 매칭
+        # ANCHOR Step 2: First association - confirmed + lost vs high-confidence
         # ═══════════════════════════════════════════════════════════════════
-        if len(normal_objects) > 0:
-            unique_classes = np.unique(normal_dets[:, 5])
+        unmatched_high_conf_by_class = {}  # 매칭안된 high confidence detection들 저장
+        unmatched_confirmed_by_class = {}  # 매칭안된 confirmed tracker들 저장
+        
+        if len(high_conf_objects) > 0:
+            unique_classes = np.unique(high_conf_dets[:, 5])
             
             for cls in unique_classes:
-                # Get detections for current class
-                cls_mask = normal_dets[:, 5] == cls
-                cls_dets = normal_dets[cls_mask]
-                cls_objects = [normal_objects[i] for i in range(len(normal_objects)) if cls_mask[i]]
+                # 클래스별 분리
+                cls_mask = high_conf_dets[:, 5] == cls
+                cls_dets = high_conf_dets[cls_mask]
+                cls_objects = [high_conf_objects[i] for i in range(len(high_conf_objects)) if cls_mask[i]]
 
-                # Get trackers for current class
-                if cls not in self.trackers_by_class:
-                    self.trackers_by_class[cls] = []
-                cls_trackers = self.trackers_by_class[cls]
-
-                # get predicted locations from existing trackers (confirmed only)
-                trks = np.zeros((len(cls_trackers), 5))
-                confs = np.zeros((len(cls_trackers), 1))
-
-                for t in range(len(trks)):
-                    pos = cls_trackers[t].predict()[0]
-                    confs[t] = cls_trackers[t].get_confidence()
-                    trks[t] = [pos[0], pos[1], pos[2], pos[3], confs[t, 0]]
+                # C++과 동일: tracked만 predict, lost는 predict 안 함
+                tracked_trackers = []
+                lost_trackers = []
                 
-                # tentative tracker들도 예측 수행
-                if cls in self.tentative_trackers_by_class:
-                    for tentative_tracker in self.tentative_trackers_by_class[cls]:
-                        tentative_tracker.predict()
+                if cls in self.trackers_by_class:
+                    tracked_trackers.extend(self.trackers_by_class[cls])
+                if cls in self.lost_trackers_by_class:
+                    lost_trackers.extend(self.lost_trackers_by_class[cls])
 
+                # tracked tracker들만 predict 호출 (C++과 동일)
+                for tracker in tracked_trackers:
+                    tracker.predict()
+                
+                # strack_pool = tracked + lost (C++의 joint_stracks와 동일)
+                strack_pool = tracked_trackers + lost_trackers
+                
+                if len(strack_pool) == 0:
+                    # tracker가 없으면 모든 detection이 unmatched
+                    unmatched_high_conf_by_class[cls] = list(range(len(cls_dets)))
+                    continue
+
+                # tracker들의 현재 상태 추출 (predict는 이미 호출됨)
+                trks = np.zeros((len(strack_pool), 5))
+                confs = np.zeros((len(strack_pool), 1))
+                
+                for t in range(len(strack_pool)):
+                    pos = strack_pool[t].get_state()[0]  # predict 대신 get_state 사용
+                    confs[t] = strack_pool[t].get_confidence()
+                    trks[t] = [pos[0], pos[1], pos[2], pos[3], confs[t, 0]]
+
+                # confidence boost
                 if self.use_dlo_boost:
                     cls_dets = self.dlo_confidence_boost(cls_dets, self.use_rich_s, self.use_sb, self.use_vt)
-
                 if self.use_duo_boost:
                     cls_dets = self.duo_confidence_boost(cls_dets)
 
+                # threshold filtering
                 remain_inds = cls_dets[:, 4] >= self.det_thresh
                 cls_dets = cls_dets[remain_inds]
                 cls_objects = [cls_objects[i] for i, keep in enumerate(remain_inds) if keep]
                 scores = cls_dets[:, 4]
 
-                # Generate embeddings
+                if len(cls_dets) == 0:
+                    # 모든 detection이 threshold 미달
+                    unmatched_confirmed_by_class[cls] = tracked_trackers
+                    continue
+
+                # embedding
                 dets_embs = np.ones((cls_dets.shape[0], 1))
                 emb_cost = None
                 if self.embedder and cls_dets.size > 0:
                     dets_embs = self.embedder.compute_embedding(img_numpy, cls_dets[:, :4], tag)
                     trk_embs = []
-                    for t in range(len(cls_trackers)):
-                        trk_embs.append(cls_trackers[t].get_emb())
+                    for t in range(len(strack_pool)):
+                        trk_embs.append(strack_pool[t].get_emb())
                     trk_embs = np.array(trk_embs)
                     if trk_embs.size > 0 and cls_dets.size > 0:
                         emb_cost = dets_embs.reshape(dets_embs.shape[0], -1) @ trk_embs.reshape((trk_embs.shape[0], -1)).T
-                emb_cost = None if self.embedder is None else emb_cost
 
-                matched, unmatched_dets, unmatched_trks, sym_matrix = associate(
-                    cls_dets,
-                    trks,
-                    self.iou_threshold,
-                    mahalanobis_distance=self.get_mh_dist_matrix(cls_dets, cls_trackers),
-                    track_confidence=confs,
-                    detection_confidence=scores,
-                    emb_cost=emb_cost,
-                    lambda_iou=self.lambda_iou,
-                    lambda_mhd=self.lambda_mhd,
-                    lambda_shape=self.lambda_shape
+                # 첫 번째 매칭: strack_pool vs high-confidence detections
+                matched, unmatched_dets, unmatched_trks, _ = associate(
+                    cls_dets, trks, self.iou_threshold,
+                    mahalanobis_distance=self.get_mh_dist_matrix_for_trackers(cls_dets, strack_pool),
+                    track_confidence=confs, detection_confidence=scores, emb_cost=emb_cost,
+                    lambda_iou=self.lambda_iou, lambda_mhd=self.lambda_mhd, lambda_shape=self.lambda_shape
                 )
 
                 trust = (cls_dets[:, 4] - self.det_thresh) / (1 - self.det_thresh)
                 af = 0.95
                 dets_alpha = af + (1 - af) * (1 - trust)
 
-                # 매칭된 detection들에 track_id 부여
+                # 매칭 처리 - 임시 리스트에 추가
                 for m in matched:
                     det_idx, trk_idx = m[0], m[1]
-                    cls_trackers[trk_idx].update(cls_dets[det_idx, :], scores[det_idx])
-                    cls_trackers[trk_idx].update_emb(dets_embs[det_idx], alpha=dets_alpha[det_idx])
+                    tracker = strack_pool[trk_idx]
+                    tracker.update(cls_dets[det_idx, :], scores[det_idx])
+                    tracker.update_emb(dets_embs[det_idx], alpha=dets_alpha[det_idx])
                     
-                    # ObjectMeta에 track_id 부여 (confirmed tracker는 양수)
-                    cls_objects[det_idx].track_id = cls_trackers[trk_idx].id
+                    # track_id 할당
+                    cls_objects[det_idx].track_id = tracker.id
+                    
+                    # 상태에 따른 처리 - 임시 리스트에 추가
+                    if tracker.state == "Tracked":
+                        # activated_stracks에 추가
+                        if cls not in activated_trackers_by_class:
+                            activated_trackers_by_class[cls] = []
+                        activated_trackers_by_class[cls].append(tracker)
+                    else:  # Lost 상태였던 tracker
+                        # refind_stracks에 추가
+                        tracker.re_activate(cls_dets[det_idx, :], scores[det_idx], self.frame_count)
+                        if cls not in refind_trackers_by_class:
+                            refind_trackers_by_class[cls] = []
+                        refind_trackers_by_class[cls].append(tracker)
 
-                # 매칭되지 않은 detection들은 tentative tracker로 생성
-                for i in unmatched_dets:
-                    if cls_dets[i, 4] >= self.det_thresh:
-                        # 최대 추적 수 제한 확인
-                        if self.check_max_tracks_limit(cls):
-                            # tentative tracker 생성 (바로 confirmed tracker로 만들지 않음)
-                            tentative_tracker = self.create_tentative_tracker(cls_dets[i, :], dets_embs[i], cls)
-                            # ObjectMeta에 tentative track_id 부여 (이미 음수 ID)
-                            cls_objects[i].track_id = tentative_tracker.id
-                        # else:
-                        #     print(f"[Max tracks limit] Class {cls}: Cannot create new tracker, limit reached")
-                        else:
-                            pass
-
-                # 매칭되지 않은 tracker들을 lost 상태로 전환
+                # 매칭안된 것들 저장
+                unmatched_high_conf_by_class[cls] = unmatched_dets
+                
+                # 매칭안된 confirmed tracker들만 분리 (C++의 r_tracked_stracks)
+                unmatched_confirmed = []
                 for trk_idx in unmatched_trks:
-                    if trk_idx < len(cls_trackers):
-                        tracker = cls_trackers[trk_idx]
-                        if tracker.time_since_update < self.max_age:  # 아직 유효한 tracker만
-                            # lost 상태로 전환
-                            tracker.mark_lost()
-                            
-                            # lost tracker 컨테이너로 이동
-                            if cls not in self.lost_trackers_by_class:
-                                self.lost_trackers_by_class[cls] = []
-                            self.lost_trackers_by_class[cls].append(tracker)
-                            
-                            # 저신뢰도 객체와의 매칭을 위해 정보 저장
-                            unmatched_trackers_info.append({
-                                'tracker': tracker,
-                                'class': cls,
-                                'trackers_list': cls_trackers,
-                                'tracker_idx': trk_idx
-                            })
-                
-                # lost로 전환된 tracker들을 confirmed tracker 리스트에서 제거
-                confirmed_trackers = []
-                for i, trk in enumerate(cls_trackers):
-                    if i not in unmatched_trks or trk.time_since_update >= self.max_age:
-                        confirmed_trackers.append(trk)
-                self.trackers_by_class[cls] = confirmed_trackers
+                    if strack_pool[trk_idx].state == "Tracked":
+                        unmatched_confirmed.append(strack_pool[trk_idx])
+                unmatched_confirmed_by_class[cls] = unmatched_confirmed
 
-                # 활성 tracker들에 해당하는 ObjectMeta만 결과에 추가
-                for i, obj in enumerate(cls_objects):
-                    if obj.track_id is not None:
-                        # 정식 tracker 확인
-                        if obj.track_id > 0:  # 양수면 정식 tracker
-                            for trk in cls_trackers:
-                                if trk.id == obj.track_id:
-                                    if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
-                                        tracked_objects.append(obj)
-                                    break
-                        else:  # 음수면 tentative tracker
-                            if cls in self.tentative_trackers_by_class:
-                                for tentative_trk in self.tentative_trackers_by_class[cls]:
-                                    if tentative_trk.id == obj.track_id:
-                                        if (tentative_trk.time_since_update < 1) and tentative_trk.hit_streak >= 1:
-                                            tracked_objects.append(obj)
-                                        break
+        # ════════════════════════════════════════════════════
+        # ANCHOR Step 3: Second association - unmatched confirmed vs low-confidence
+        # ═══════════════════════════════════════════════════════════════════
+        if low_conf_objects:
+            # 저신뢰도 객체들을 numpy 배열로 변환
+            low_conf_dets = []
+            for obj in low_conf_objects:
+                x1, y1, x2, y2 = obj.box
+                det = [x1, y1, x2, y2, obj.confidence, obj.class_id]
+                low_conf_dets.append(det)
+            low_conf_dets = np.array(low_conf_dets)
 
-        # ═══════════════════════════════════════════════════════════════════
-        # 단계 1.5: Tentative tracker들과 매칭되지 않은 detection들 매칭
-        # ═══════════════════════════════════════════════════════════════════
-        if len(normal_objects) > 0:
-            unique_classes = np.unique(normal_dets[:, 5])
+            low_unique_classes = np.unique(low_conf_dets[:, 5])
             
-            for cls in unique_classes:
-                # tentative tracker들 처리
-                if cls in self.tentative_trackers_by_class and len(self.tentative_trackers_by_class[cls]) > 0:
-                    tentative_trackers = self.tentative_trackers_by_class[cls]
+            for cls in low_unique_classes:
+                if cls not in unmatched_confirmed_by_class or not unmatched_confirmed_by_class[cls]:
+                    continue
                     
-                    # 매칭되지 않은 detection들 중에서 tentative tracker들과 매칭할 대상들 찾기
-                    remaining_dets = []
-                    remaining_objects = []
-                    
-                    for i, obj in enumerate(normal_objects):
-                        if normal_dets[np.where(np.array([o == obj for o in normal_objects]))[0][0], 5] == cls and obj.track_id is None:
-                            remaining_dets.append(normal_dets[np.where(np.array([o == obj for o in normal_objects]))[0][0]])
-                            remaining_objects.append(obj)
-                    
-                    if remaining_dets:
-                        remaining_dets = np.array(remaining_dets)
-                        
-                        # tentative tracker들의 predicted position 추출
-                        tentative_trks = np.zeros((len(tentative_trackers), 5))
-                        tentative_confs = np.zeros((len(tentative_trackers), 1))
-                        
-                        for t, tracker in enumerate(tentative_trackers):
-                            pos = tracker.get_state()[0]
-                            tentative_confs[t] = tracker.get_confidence()
-                            tentative_trks[t] = [pos[0], pos[1], pos[2], pos[3], tentative_confs[t, 0]]
-                        
-                        # tentative tracker들과 남은 detection들 매칭 (더 관대한 threshold)
-                        tentative_matched, tentative_unmatched_dets, tentative_unmatched_trks, _ = associate(
-                            remaining_dets,
-                            tentative_trks,
-                            self.iou_threshold * 0.7,  # tentative용 더 관대한 threshold
-                            mahalanobis_distance=self.get_mh_dist_matrix_for_trackers(remaining_dets, tentative_trackers),
-                            track_confidence=tentative_confs,
-                            detection_confidence=remaining_dets[:, 4],
-                            emb_cost=None,  # tentative는 embedding 비용 사용 안함
-                            lambda_iou=self.lambda_iou,
-                            lambda_mhd=self.lambda_mhd,
-                            lambda_shape=self.lambda_shape
-                        )
-                        
-                        # 매칭된 tentative tracker들 업데이트
-                        for m in tentative_matched:
-                            det_idx, trk_idx = m[0], m[1]
-                            tentative_tracker = tentative_trackers[trk_idx]
-                            tentative_tracker.update(remaining_dets[det_idx, :], remaining_dets[det_idx, 4])
-                            
-                            # ObjectMeta에 tentative track_id 부여 (이미 음수 ID)
-                            remaining_objects[det_idx].track_id = tentative_tracker.id
-                            
-                            # 수습 기간 통과했으면 정식 활성화
-                            if self.frame_count - tentative_tracker.start_frame >= self.probation_age:
-                                tentative_tracker.activate(self.frame_count)
-                                # confirmed tracker로 이동
-                                if cls not in self.trackers_by_class:
-                                    self.trackers_by_class[cls] = []
-                                self.trackers_by_class[cls].append(tentative_tracker)
-                                # 정식 track_id로 변경 (activate에서 새로운 양수 ID 할당됨)
-                                remaining_objects[det_idx].track_id = tentative_tracker.id
+                # 클래스별 저신뢰도 detection 분리
+                low_cls_mask = low_conf_dets[:, 5] == cls
+                low_cls_dets = low_conf_dets[low_cls_mask]
+                low_cls_objects = [low_conf_objects[i] for i in range(len(low_conf_objects)) if low_cls_mask[i]]
                 
-                # tentative tracker들 정리 (수습 기간 통과한 것들 제거)
-                to_activate = self.process_tentative_trackers(cls)
+                unmatched_confirmed = unmatched_confirmed_by_class[cls]
                 
-                # 매칭 실패한 tentative tracker들 조기 제거
-                self.remove_failed_tentative_trackers(cls)
+                # 매칭안된 confirmed tracker들의 predicted position
+                low_trks = np.zeros((len(unmatched_confirmed), 5))
+                low_confs = np.zeros((len(unmatched_confirmed), 1))
                 
-                # ═══════════════════════════════════════════════════════════════════
-                # Re-matching: lost tracker들과 새로 활성화될 tracker들 매칭
-                # ═══════════════════════════════════════════════════════════════════
-                if to_activate and cls in self.lost_trackers_by_class and len(self.lost_trackers_by_class[cls]) > 0:
-                    lost_trackers = self.lost_trackers_by_class[cls]
+                for t, tracker in enumerate(unmatched_confirmed):
+                    pos = tracker.get_state()[0]
+                    low_confs[t] = tracker.get_confidence()
+                    low_trks[t] = [pos[0], pos[1], pos[2], pos[3], low_confs[t, 0]]
+
+                # 두 번째 매칭: unmatched confirmed vs low-confidence (더 관대한 threshold)
+                low_matched, low_unmatched_dets, low_unmatched_trks, _ = associate(
+                    low_cls_dets, low_trks, self.iou_threshold * 0.8,  # 더 관대한 threshold
+                    mahalanobis_distance=self.get_mh_dist_matrix_for_trackers(low_cls_dets, unmatched_confirmed),
+                    track_confidence=low_confs, detection_confidence=low_cls_dets[:, 4], emb_cost=None,
+                    lambda_iou=self.lambda_iou, lambda_mhd=self.lambda_mhd, lambda_shape=self.lambda_shape
+                )
+
+                # 저신뢰도 매칭 처리 - 임시 리스트에 추가
+                for m in low_matched:
+                    det_idx, trk_idx = m[0], m[1]
+                    tracker = unmatched_confirmed[trk_idx]
+                    tracker.update(low_cls_dets[det_idx, :], low_cls_dets[det_idx, 4])
                     
+                    # activated_stracks에 추가
+                    if cls not in activated_trackers_by_class:
+                        activated_trackers_by_class[cls] = []
+                    activated_trackers_by_class[cls].append(tracker)
+                    
+                    # track_id 할당
+                    low_cls_objects[det_idx].track_id = tracker.id
+
+                # 매칭안된 confirmed tracker들을 lost로 전환 - 임시 리스트에 추가
+                for trk_idx in low_unmatched_trks:
+                    tracker = unmatched_confirmed[trk_idx]
+                    if tracker.state != "Lost":
+                        tracker.mark_lost()
+                        if cls not in lost_trackers_by_class:
+                            lost_trackers_by_class[cls] = []
+                        lost_trackers_by_class[cls].append(tracker)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ANCHOR Step 4: Third association - tentative vs unmatched high-confidence
+        # ═══════════════════════════════════════════════════════════════════
+        to_activate_by_class = {}  # probation_age 지난 tentative들
+        
+        for cls in unmatched_high_conf_by_class:
+            unmatched_det_indices = unmatched_high_conf_by_class[cls]
+            if len(unmatched_det_indices) == 0:
+                continue
+                
+            # 해당 클래스의 매칭안된 high-confidence detection들
+            cls_mask = high_conf_dets[:, 5] == cls
+            cls_dets = high_conf_dets[cls_mask]
+            cls_objects = [high_conf_objects[i] for i in range(len(high_conf_objects)) if cls_mask[i]]
+            
+            remaining_dets = cls_dets[unmatched_det_indices]
+            remaining_objects = [cls_objects[i] for i in unmatched_det_indices]
+            
+            # tentative tracker들과 매칭
+            if cls in self.tentative_trackers_by_class and self.tentative_trackers_by_class[cls]:
+                tentative_trackers = self.tentative_trackers_by_class[cls]
+                
+                # tentative tracker들의 predicted position
+                tentative_trks = np.zeros((len(tentative_trackers), 5))
+                tentative_confs = np.zeros((len(tentative_trackers), 1))
+                
+                for t, tracker in enumerate(tentative_trackers):
+                    pos = tracker.predict()[0]  # predict 호출
+                    tentative_confs[t] = tracker.get_confidence()
+                    tentative_trks[t] = [pos[0], pos[1], pos[2], pos[3], tentative_confs[t, 0]]
+
+                # 세 번째 매칭: tentative vs unmatched high-confidence
+                tentative_matched, tentative_unmatched_dets, tentative_unmatched_trks, _ = associate(
+                    remaining_dets, tentative_trks, self.iou_threshold * 0.7,  # tentative용 관대한 threshold
+                    mahalanobis_distance=self.get_mh_dist_matrix_for_trackers(remaining_dets, tentative_trackers),
+                    track_confidence=tentative_confs, detection_confidence=remaining_dets[:, 4], emb_cost=None,
+                    lambda_iou=self.lambda_iou, lambda_mhd=self.lambda_mhd, lambda_shape=self.lambda_shape
+                )
+                
+                # tentative 매칭 처리
+                to_activate_tracks = []
+                remaining_tentative = []
+                
+                for m in tentative_matched:
+                    det_idx, trk_idx = m[0], m[1]
+                    tracker = tentative_trackers[trk_idx]
+                    tracker.update(remaining_dets[det_idx, :], remaining_dets[det_idx, 4])
+                    
+                    # probation_age 확인
+                    if self.frame_count - tracker.start_frame > self.probation_age:
+                        # 활성화 대상
+                        to_activate_tracks.append(tracker)
+                        remaining_objects[det_idx].track_id = tracker.id  # 임시 ID 할당 (나중에 변경됨)
+                    else:
+                        # 아직 수습 중 - tentative_stracks에 추가
+                        remaining_tentative.append(tracker)
+                        remaining_objects[det_idx].track_id = tracker.id
+                        if cls not in tentative_trackers_by_class:
+                            tentative_trackers_by_class[cls] = []
+                        tentative_trackers_by_class[cls].append(tracker)
+                
+                # 매칭안된 tentative들 처리
+                for trk_idx in tentative_unmatched_trks:
+                    tracker = tentative_trackers[trk_idx]
+                    # early termination 확인
+                    if self.frame_count - tracker.end_frame <= self.early_termination_age:
+                        if cls not in tentative_trackers_by_class:
+                            tentative_trackers_by_class[cls] = []
+                        tentative_trackers_by_class[cls].append(tracker)
+                    else:
+                        # 조기 제거 - removed_stracks에 추가
+                        tracker.mark_removed()
+                        if cls not in removed_trackers_by_class:
+                            removed_trackers_by_class[cls] = []
+                        removed_trackers_by_class[cls].append(tracker)
+                
+                to_activate_by_class[cls] = to_activate_tracks
+                
+                # 남은 unmatched detection들 업데이트 (인덱스 변환 필요)
+                final_unmatched_indices = []
+                for remaining_idx in tentative_unmatched_dets:
+                    original_idx = unmatched_det_indices[remaining_idx]
+                    final_unmatched_indices.append(original_idx)
+                unmatched_high_conf_by_class[cls] = final_unmatched_indices
+            else:
+                # tentative tracker가 없으면 모든 detection이 여전히 unmatched
+                to_activate_by_class[cls] = []
+
+        # ═══════════════════════════════════════════════════════════════════  
+        # ANCHOR Step 5: Re-matching - lost vs to_activate
+        # ═══════════════════════════════════════════════════════════════════
+        for cls in to_activate_by_class:
+            to_activate_tracks = to_activate_by_class[cls]
+            if not to_activate_tracks:
+                continue
+                
+            if cls in self.lost_trackers_by_class:
+                already_lost_stracks = [t for t in self.lost_trackers_by_class[cls] if t.state == "Lost"]
+                
+                if len(already_lost_stracks) > 0:
                     # DIoU distance 계산
-                    diou_distances = self.diou_distance(lost_trackers, to_activate)
+                    diou_distances = self.diou_distance(already_lost_stracks, to_activate_tracks)
                     
-                    # Re-matching 수행 (매우 관대한 threshold로 거의 모든 매칭 허용)
+                    # Re-matching 수행 (매우 관대한 threshold)
                     rematches, unmatched_lost, unmatched_new = self.linear_assignment_simple(
                         diou_distances, threshold=999999.0
                     )
                     
-                    # Re-matching 성공한 경우들 처리
-                    rematched_trackers = []
+                    # Re-matching 처리 - 임시 리스트에 추가
                     for match in rematches:
                         lost_idx, new_idx = match[0], match[1]
-                        lost_tracker = lost_trackers[lost_idx]
-                        new_tracker = to_activate[new_idx]
+                        lost_tracker = already_lost_stracks[lost_idx]
+                        new_tracker = to_activate_tracks[new_idx]
                         
-                        # lost tracker를 새 detection으로 재활성화
+                        # lost tracker 재활성화
                         new_bbox = new_tracker.get_state()[0]
                         lost_tracker.re_activate(new_bbox, new_tracker.kf.x[4] if len(new_tracker.kf.x) > 4 else 0.5, self.frame_count)
                         
-                        # lost tracker를 confirmed tracker로 복귀
-                        if cls not in self.trackers_by_class:
-                            self.trackers_by_class[cls] = []
-                        self.trackers_by_class[cls].append(lost_tracker)
-                        rematched_trackers.append(lost_tracker)
+                        # rematched_stracks에 추가
+                        if cls not in rematched_trackers_by_class:
+                            rematched_trackers_by_class[cls] = []
+                        rematched_trackers_by_class[cls].append(lost_tracker)
                         
-                        # new tracker는 제거 표시 (ID 재사용됨)
+                        # new tracker 제거 표시
                         new_tracker.state = "Removed"
-                        
-                        # print(f"[Re-match] Class {cls}: Lost tracker {lost_tracker.id} re-matched with new tracker {new_tracker.id}")
                     
-                    # Re-matching된 lost tracker들을 lost 리스트에서 제거
-                    remaining_lost = [lost_trackers[i] for i in range(len(lost_trackers)) if i not in [m[0] for m in rematches]]
-                    self.lost_trackers_by_class[cls] = remaining_lost
-                    
-                    # Re-matching되지 않은 새 tracker들만 confirmed로 추가
+                    # 매칭안된 새 tracker들 활성화 - activated_stracks에 추가
                     for i in unmatched_new:
-                        new_tracker = to_activate[i]
-                        new_tracker.activate(self.frame_count)
-                        if cls not in self.trackers_by_class:
-                            self.trackers_by_class[cls] = []
-                        self.trackers_by_class[cls].append(new_tracker)
-                        # print(f"[New tracker] Class {cls}: New tracker {new_tracker.id} activated")
+                        tracker = to_activate_tracks[i]
+                        old_id = tracker.id  # 이전 음수 ID 저장
+                        tracker.activate(self.frame_count, self.get_next_id)
+                        if cls not in activated_trackers_by_class:
+                            activated_trackers_by_class[cls] = []
+                        activated_trackers_by_class[cls].append(tracker)
                         
-                elif to_activate:
-                    # Lost tracker가 없는 경우 모든 tentative tracker를 confirmed로 활성화
-                    for new_tracker in to_activate:
-                        new_tracker.activate(self.frame_count)
+                        # track_id 업데이트
+                        for obj in high_conf_objects:
+                            if hasattr(obj, 'track_id') and obj.track_id == old_id:
+                                obj.track_id = tracker.id  # 새로운 양수 ID로 업데이트
+                                break
+                else:
+                    # lost tracker가 없으면 모든 to_activate를 직접 활성화
+                    for tracker in to_activate_tracks:
+                        old_id = tracker.id  # 이전 음수 ID 저장
+                        tracker.activate(self.frame_count, self.get_next_id)
+                        if cls not in activated_trackers_by_class:
+                            activated_trackers_by_class[cls] = []
+                        activated_trackers_by_class[cls].append(tracker)
+                        
+                        # track_id 업데이트
+                        for obj in high_conf_objects:
+                            if hasattr(obj, 'track_id') and obj.track_id == old_id:
+                                obj.track_id = tracker.id  # 새로운 양수 ID로 업데이트
+                                break
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ANCHOR Step 6: Init new stracks - 남은 unmatched high-confidence로 새 tentative 생성
+        # ═══════════════════════════════════════════════════════════════════
+        for cls in unmatched_high_conf_by_class:
+            unmatched_det_indices = unmatched_high_conf_by_class[cls]
+            if len(unmatched_det_indices) == 0:
+                continue
+                
+            # 해당 클래스의 매칭안된 detection들
+            cls_mask = high_conf_dets[:, 5] == cls
+            cls_dets = high_conf_dets[cls_mask]
+            cls_objects = [high_conf_objects[i] for i in range(len(high_conf_objects)) if cls_mask[i]]
+            
+            for i in unmatched_det_indices:
+                if cls_dets[i, 4] >= self.det_thresh:
+                    # 최대 추적 수 제한 확인
+                    if self.check_max_tracks_limit(cls):
+                        # 새 tentative tracker 생성
+                        dets_embs = np.ones((1, 1))
+                        if self.embedder:
+                            dets_embs = self.embedder.compute_embedding(img_numpy, cls_dets[i:i+1, :4], tag)
+                        
+                        tentative_tracker = self.create_tentative_tracker(cls_dets[i, :], dets_embs[0] if self.embedder else None, cls)
+                        cls_objects[i].track_id = tentative_tracker.id
+                        
+                        # 멤버변수 클래스 키 추가
                         if cls not in self.trackers_by_class:
                             self.trackers_by_class[cls] = []
-                        self.trackers_by_class[cls].append(new_tracker)
-                        # print(f"[Direct activate] Class {cls}: Tracker {new_tracker.id} activated")
+                        if cls not in self.lost_trackers_by_class:
+                            self.lost_trackers_by_class[cls] = []
+                        if cls not in self.tentative_trackers_by_class:
+                            self.tentative_trackers_by_class[cls] = []
+                        
+                        # tentative_stracks에 추가
+                        if cls not in tentative_trackers_by_class:
+                            tentative_trackers_by_class[cls] = []
+                        tentative_trackers_by_class[cls].append(tentative_tracker)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 단계 2: 저신뢰도 객체들과 매칭되지 않은 tracker들을 매칭
+        # Step 7: Update state - C++의 Step 5와 동일한 멤버변수 업데이트
         # ═══════════════════════════════════════════════════════════════════
-        if low_conf_objects and unmatched_trackers_info:
-            
-            # 저신뢰도 객체들을 numpy 배열로 변환
-            low_dets = []
-            for obj in low_conf_objects:
-                x1, y1, x2, y2 = obj.box
-                det = [x1, y1, x2, y2, obj.confidence, obj.class_id]
-                low_dets.append(det)
-            low_dets = np.array(low_dets)
-
-            # 매칭되지 않은 tracker들의 predicted position 추출
-            unmatched_trks = np.zeros((len(unmatched_trackers_info), 5))
-            unmatched_confs = np.zeros((len(unmatched_trackers_info), 1))
-            
-            for i, info in enumerate(unmatched_trackers_info):
-                tracker = info['tracker']
-                pos = tracker.get_state()[0]
-                unmatched_confs[i] = tracker.get_confidence()
-                unmatched_trks[i] = [pos[0], pos[1], pos[2], pos[3], unmatched_confs[i, 0]]
-
-            # 저신뢰도 객체들과 매칭되지 않은 tracker들 간 매칭
-            low_scores = low_dets[:, 4]
-            
-            # 매칭 수행 (더 관대한 threshold 사용)
-            low_matched, low_unmatched_dets, low_unmatched_trks, _ = associate(
-                low_dets,
-                unmatched_trks,
-                self.iou_threshold * 0.8,  # 저신뢰도 객체용 더 관대한 threshold
-                mahalanobis_distance=self.get_mh_dist_matrix_for_trackers(low_dets, [info['tracker'] for info in unmatched_trackers_info]),
-                track_confidence=unmatched_confs,
-                detection_confidence=low_scores,
-                emb_cost=None,  # 저신뢰도 객체는 embedding 비용 사용 안함
-                lambda_iou=self.lambda_iou,
-                lambda_mhd=self.lambda_mhd,
-                lambda_shape=self.lambda_shape
-            )
-
-            # 매칭된 저신뢰도 객체들에 track_id 부여
-            for m in low_matched:
-                det_idx, trk_idx = m[0], m[1]
-                tracker_info = unmatched_trackers_info[trk_idx]
-                tracker = tracker_info['tracker']
-                
-                # tracker 업데이트
-                tracker.update(low_dets[det_idx, :], low_scores[det_idx])
-                
-                # ObjectMeta에 track_id 부여
-                low_conf_objects[det_idx].track_id = tracker.id
-
-            # 매칭된 저신뢰도 객체들을 결과에 추가
-            for i, obj in enumerate(low_conf_objects):
-                if obj.track_id is not None:
-                    # tracker 상태 확인
-                    for info in unmatched_trackers_info:
-                        if info['tracker'].id == obj.track_id:
-                            tracker = info['tracker']
-                            if (tracker.time_since_update < 1) and (tracker.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
-                                tracked_objects.append(obj)
-                            break
-
-            # 매칭되지 않은 저신뢰도 객체들은 버림 (새로운 tracker 생성하지 않음)
-            # (디버깅 출력 제거)
-
-        # 매칭되지 않은 저신뢰도 객체들은 버림 (새로운 tracker 생성하지 않음)
-        elif low_conf_objects:
-            pass  # 저신뢰도 객체들을 버림
+        self._update_member_variables(
+            activated_trackers_by_class, 
+            lost_trackers_by_class, 
+            refind_trackers_by_class, 
+            rematched_trackers_by_class,
+            tentative_trackers_by_class,
+            removed_trackers_by_class
+        )
 
         # ═══════════════════════════════════════════════════════════════════
-        # 단계 3: 죽은 tracker들 제거
+        # Final output: 멤버변수 업데이트 후 최종 tracked_objects 생성 (C++과 동일)
         # ═══════════════════════════════════════════════════════════════════
-        # 정식 tracker들 제거
-        for cls, cls_trackers in self.trackers_by_class.items():
-            i = len(cls_trackers)
-            for trk in reversed(cls_trackers):
-                if trk.time_since_update > self.max_age:
-                    cls_trackers.pop(i-1)
-                i -= 1
+        tracked_objects = []
         
-        # tentative tracker들 제거 (더 엄격한 기준)
-        for cls in list(self.tentative_trackers_by_class.keys()):
-            if cls in self.tentative_trackers_by_class:
-                tentative_trackers = self.tentative_trackers_by_class[cls]
-                surviving_tentative = []
-                
-                for trk in tentative_trackers:
-                    # tentative tracker는 더 빨리 제거 (max_age의 절반)
-                    if trk.time_since_update <= self.max_age // 2:
-                        surviving_tentative.append(trk)
-                
-                self.tentative_trackers_by_class[cls] = surviving_tentative
+        # 모든 input objects에 대해 tracker ID 매핑 생성
+        id_to_object = {}
+        for obj in objects:
+            if hasattr(obj, 'track_id') and obj.track_id is not None:
+                id_to_object[obj.track_id] = obj
         
-        # lost tracker들 제거 (시간 기반)
-        for cls in list(self.lost_trackers_by_class.keys()):
-            if cls in self.lost_trackers_by_class:
-                lost_trackers = self.lost_trackers_by_class[cls]
-                surviving_lost = []
-                
-                for trk in lost_trackers:
-                    # lost tracker는 max_age * 2 까지 유지 (re-matching 기회 제공)
-                    if trk.time_since_update <= self.max_age * 2:
-                        surviving_lost.append(trk)
-                    else:
-                        # print(f"[Remove lost] Class {cls}: Lost tracker {trk.id} permanently removed")
-                        pass
-                
-                self.lost_trackers_by_class[cls] = surviving_lost
+        # self.trackers_by_class에 있는 activated tracker들만 최종 결과에 포함 (C++과 동일)
+        for cls_trackers in self.trackers_by_class.values():
+            for tracker in cls_trackers:
+                if tracker.is_activated and (tracker.time_since_update < 1) and \
+                   (tracker.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                    if tracker.id in id_to_object:
+                        tracked_objects.append(id_to_object[tracker.id])
 
         return tracked_objects
-    
-    def process_tentative_trackers(self, cls):
-        """tentative tracker들을 처리하여 활성화할 tracker들 반환"""
-        if cls not in self.tentative_trackers_by_class:
-            self.tentative_trackers_by_class[cls] = []
+
+    def _update_member_variables(self, activated_by_class, lost_by_class, 
+                                refind_by_class, rematched_by_class, 
+                                tentative_by_class, removed_by_class):
+        """C++의 Step 5: Update state와 동일한 로직으로 멤버변수 업데이트"""
+        
+        # lost tracker들에 대해서만 max_age 체크 (C++과 동일)
+        for cls in list(self.lost_trackers_by_class.keys()):
+            if cls in self.lost_trackers_by_class:
+                surviving_lost = []
+                for trk in self.lost_trackers_by_class[cls]:
+                    if trk.time_since_update <= self.max_age:  # lost만 max_age 체크
+                        surviving_lost.append(trk)
+                    else:
+                        # max_age 초과시 removed로 전환
+                        trk.mark_removed()
+                        if cls not in removed_by_class:
+                            removed_by_class[cls] = []
+                        removed_by_class[cls].append(trk)
+                self.lost_trackers_by_class[cls] = surviving_lost
+        
+        # tracked_stracks 정리 (swap 방식, C++과 동일)
+        for cls in list(self.trackers_by_class.keys()):
+            tracked_stracks_swap = []
+            for trk in self.trackers_by_class[cls]:
+                if trk.state == "Tracked":
+                    tracked_stracks_swap.append(trk)
             
-        tentative_trackers = self.tentative_trackers_by_class[cls]
-        to_activate = []
-        remaining_tentative = []
-        
-        for tracker in tentative_trackers:
-            if tracker.state == "Tentative":
-                # 수습 기간 통과 여부 확인
-                if self.frame_count - tracker.start_frame >= self.probation_age:
-                    to_activate.append(tracker)
-                else:
-                    remaining_tentative.append(tracker)
-        
-        # tentative tracker 리스트 업데이트
-        self.tentative_trackers_by_class[cls] = remaining_tentative
-        
-        return to_activate
-    
-    def remove_failed_tentative_trackers(self, cls):
-        """매칭 실패한 tentative tracker들을 조기 제거"""
-        if cls not in self.tentative_trackers_by_class:
-            return
+            self.trackers_by_class[cls] = tracked_stracks_swap
             
-        tentative_trackers = self.tentative_trackers_by_class[cls]
-        surviving_trackers = []
+            # joint_stracks 연산으로 새로운 tracker들 합치기 (C++과 동일)
+            if cls in activated_by_class:
+                self.trackers_by_class[cls] = self.joint_stracks(
+                    self.trackers_by_class[cls], activated_by_class[cls])
+            if cls in refind_by_class:
+                self.trackers_by_class[cls] = self.joint_stracks(
+                    self.trackers_by_class[cls], refind_by_class[cls])
+            if cls in rematched_by_class:
+                self.trackers_by_class[cls] = self.joint_stracks(
+                    self.trackers_by_class[cls], rematched_by_class[cls])
         
-        for tracker in tentative_trackers:
-            # 조기 제거 조건 확인
-            if tracker.time_since_update <= self.early_termination_age:
-                surviving_trackers.append(tracker)
-            # else: 조기 제거됨 (surviving_trackers에 추가하지 않음)
+        # tentative_stracks 정리 (swap 방식, C++과 동일)
+        for cls in list(self.tentative_trackers_by_class.keys()):
+            tentative_stracks_swap = []
+            for trk in self.tentative_trackers_by_class[cls]:
+                if trk.state == "Tentative":
+                    tentative_stracks_swap.append(trk)
+            
+            self.tentative_trackers_by_class[cls] = tentative_stracks_swap
+            
+            # 새로운 tentative tracker들 합치기
+            if cls in tentative_by_class:
+                self.tentative_trackers_by_class[cls] = self.joint_stracks(
+                    self.tentative_trackers_by_class[cls], tentative_by_class[cls])
+        
+        # lost_stracks 업데이트 (C++과 동일)
+        for cls in list(self.lost_trackers_by_class.keys()):
+            # sub_stracks: lost에서 tracked된 것들 제거
+            if cls in self.trackers_by_class:
+                self.lost_trackers_by_class[cls] = self.sub_stracks(
+                    self.lost_trackers_by_class[cls], self.trackers_by_class[cls])
+            
+            # 새로 lost된 tracker들 추가
+            if cls in lost_by_class:
+                if cls not in self.lost_trackers_by_class:
+                    self.lost_trackers_by_class[cls] = []
+                self.lost_trackers_by_class[cls].extend(lost_by_class[cls])
                 
-        self.tentative_trackers_by_class[cls] = surviving_trackers
-    
+        # 새로운 클래스의 lost tracker들 추가
+        for cls in lost_by_class:
+            if cls not in self.lost_trackers_by_class:
+                self.lost_trackers_by_class[cls] = lost_by_class[cls]
+
     def create_tentative_tracker(self, bbox, emb, cls):
         """새로운 tentative tracker 생성"""
-        tracker = KalmanBoxTracker(bbox, emb, is_tentative=True)  # 🔥 is_tentative=True로 설정
+        tracker = KalmanBoxTracker(bbox, emb, is_tentative=True, class_id=int(cls), id_counter_callback=self.get_next_id)
         tracker.tentative_init(self.frame_count)
         
-        if cls not in self.tentative_trackers_by_class:
-            self.tentative_trackers_by_class[cls] = []
-        self.tentative_trackers_by_class[cls].append(tracker)
-        
+        # C++과 일치: 단순히 tracker 객체만 반환 (멤버변수 조작 안함)
         return tracker
     
     def diou_distance(self, lost_trackers, new_trackers):
