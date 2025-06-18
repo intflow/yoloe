@@ -39,7 +39,9 @@ from overlay_utils import (
     ObjectMeta,
     draw_box, draw_mask, draw_label, draw_low_conf_box, draw_low_conf_label,
     draw_objects_overlay, draw_roi_polygons, highlight_roi_objects,
-    draw_dashed_rectangle, draw_dashed_line, draw_detection_area
+    draw_dashed_rectangle, draw_dashed_line, draw_detection_area,
+    update_heatmap, check_line_crossing, draw_counting_line, 
+    draw_overlay_info, draw_heatmap_minimap
 )
 
 # ────────────────────────────── Global Debug Counter ──────────────────────────────────── #
@@ -103,9 +105,6 @@ def parse_args() -> argparse.Namespace:
                         help="Input video path")
     parser.add_argument("--output", type=str, default="output",
                         help="Output directory (optional, defaults to input filename without extension)")
-    # Logging
-    parser.add_argument("--log-detections", type=bool, default=True,
-                        help="Log detection results to label.txt")
     # Model
     parser.add_argument("--checkpoint", type=str,
                         default="pretrain/yoloe-11l-seg.pt",
@@ -414,17 +413,6 @@ def load_reference_pairs_from_folder(folder_path, class_names):
 
 
 # ─────────────────────── Geometry helpers ────────────────────────────── #
-def point_side(p, a, b) -> int:
-    """
-    Returns sign of point p relative to oriented line a->b.
-    +1 : left side, -1 : right side, 0 : on line
-    Using 2-D cross-product.
-    """
-    x, y = p
-    x1, y1 = a
-    x2, y2 = b
-    val = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
-    return 0 if val == 0 else (1 if val > 0 else -1)
 
 
 def parse_roi_zones(roi_zones_str):
@@ -1971,7 +1959,7 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
                          forward_cnt, backward_cnt, current_occupancy, current_congestion,
                          last_update_time, heatmap, last_save_frame, log_buffer,
                          # I/O 관련
-                         output_dir, out, log_file, track_log_file, track_log_buffer,
+                         output_dir, out, track_log_file, track_log_buffer,
                          # 라인 크로싱 관련
                          p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
                          width, height, output_width, output_height, scale_x, scale_y,
@@ -2042,29 +2030,6 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
             boxes_xywh = np.empty((0, 4))
             class_ids = np.empty(0, int)
             track_ids = np.empty(0, int)
-
-        # 🎯 로깅 처리 (모든 클래스 포함, confidence >= medium_thresh인 객체만 로깅)
-        if log_file is not None:
-            class_counts = defaultdict(int)
-            # medium_thresh 이상의 객체만 로깅 (저신뢰도 객체는 로깅에서 제외)
-            valid_objects = [obj for obj in tracked_objects if obj.confidence >= args.medium_conf_thresh]
-            valid_class_ids = [obj.class_id for obj in valid_objects]
-            valid_track_ids = [obj.track_id for obj in valid_objects]
-            
-            for cid in valid_class_ids:
-                if cid >= 0:  # 유효한 클래스 ID만
-                    class_counts[cid] += 1
-
-            for obj in valid_objects:
-                if obj.class_id >= 0:  # 유효한 클래스 ID만
-                    class_name = obj.class_name
-                    class_count = class_counts[obj.class_id]
-                    log_entry = f"{time_str},{class_name},{obj.track_id},{class_count}\n"
-                    log_buffer.append(log_entry)
-                    if len(log_buffer) >= 100:
-                        log_file.writelines(log_buffer)
-                        log_file.flush()
-                        log_buffer.clear()
 
         # 🎯 Track Result 로깅 (모든 추적된 객체의 상세 정보)
         if track_log_file is not None and tracked_objects:
@@ -2188,146 +2153,35 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
 
         line_crossed_this_frame = False
 
-        # 히트맵 및 라인 크로싱 처리
+        # 히트맵 업데이트
+        heatmap = update_heatmap(heatmap, tracked_objects, person_class_id, width, height)
+        
+        # 트래킹 컬러 설정
         for obj in tracked_objects:
-            if obj.track_id == -1 or obj.class_id != person_class_id:
-                continue
-
-            x1, y1, x2, y2 = obj.box
-            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            ix, iy = int(cx), int(cy)
-            
-            # 히트맵 업데이트
-            if 0 <= iy < height and 0 <= ix < width:
-                radius = 10
-                for dy in range(-radius, radius + 1):
-                    for dx in range(-radius, radius + 1):
-                        if dx*dx + dy*dy <= radius*radius:
-                            ny, nx = iy + dy, ix + dx
-                            if 0 <= ny < height and 0 <= nx < width:
-                                intensity = 1.0 * (1.0 - ((dx*dx + dy*dy) / (radius*radius)))
-                                heatmap[ny, nx] += intensity
-
-            # 트래킹 컬러 설정
             if obj.track_id not in track_color:
                 track_color[obj.track_id] = palette.by_idx(obj.track_id).as_bgr()
 
-            # 라인 크로싱 체크 (입력 해상도 기준 좌표 사용)
-            if p1_input is not None and p2_input is not None:
-                side_now = point_side((cx, cy), p1_input, p2_input)
-                t = ((cx - p1_input[0]) * seg_dx + (cy - p1_input[1]) * seg_dy) / seg_len2
-                inside = 0.0 <= t <= 1.0
-
-                side_prev = track_side.get(obj.track_id, side_now)
-                if inside and (side_prev * side_now < 0):
-                    line_crossed_this_frame = True
-                    if side_prev < 0 < side_now:
-                        updated_state['forward_cnt'] += 1
-                    elif side_prev > 0 > side_now:
-                        updated_state['backward_cnt'] += 1
-                if inside and side_now != 0:
-                    track_side[obj.track_id] = side_now
+        # 라인 크로싱 체크
+        line_crossed_this_frame, forward_delta, backward_delta = check_line_crossing(
+            tracked_objects, person_class_id, track_side, 
+            p1_input, p2_input, seg_dx, seg_dy, seg_len2
+        )
+        updated_state['forward_cnt'] += forward_delta
+        updated_state['backward_cnt'] += backward_delta
 
         # 라인 그리기 (출력 해상도에 맞게 스케일링)
-        if p1 is not None and p2 is not None:
-            line_thickness = 8
-            
-            if line_crossed_this_frame:
-                cv2.line(annotated, p1, p2, (255, 0, 0), line_thickness)
-            else:
-                cv2.line(annotated, p1, p2, (255, 255, 255), line_thickness)
+        annotated = draw_counting_line(annotated, p1, p2, line_crossed_this_frame)
 
-            mid_x, mid_y = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
-            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-            perp_x, perp_y = -dy, dx
-            length = 50
-            mag = (perp_x**2 + perp_y**2) ** 0.5 or 1
-            perp_x, perp_y = int(perp_x / mag * length), int(perp_y / mag * length)
-            arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
-            cv2.arrowedLine(annotated, arrow_start, arrow_end, (0, 255, 0), line_thickness, tipLength=0.6)
+        # Overlay 정보 그리기
+        annotated = draw_overlay_info(
+            annotated, updated_state['current_congestion'], 
+            updated_state['forward_cnt'], updated_state['backward_cnt'], 
+            updated_state['current_occupancy'], time_str, roi_manager, 
+            output_width, output_height
+        )
 
-        # Overlay 정보 그리기 (ROI 정보 추가)
-        overlay = [
-            f"[1] Congestion : {updated_state['current_congestion']:3d} %",
-            f"[2] Crossing   : forward {updated_state['forward_cnt']} | backward {updated_state['backward_cnt']}",
-            f"[3] Occupancy  : {updated_state['current_occupancy']}",
-            f"[4] Time      : {time_str}"
-        ]
-        
-        # ROI 접근 횟수 정보 추가
-        if roi_manager is not None:
-            for roi_name, roi_stat in roi_manager.roi_stats.items():
-                overlay.append(f"[ROI] {roi_name}: {roi_stat['total_access']} accesses")
-        
-        # 오버레이 텍스트 크기 (0~1 정규화 좌표를 출력 해상도에 맞게 스케일링)
-        # 1920x1080 기준: x0=30, y0=60, dy=50, padding=10
-        # 정규화: x0=30/1920=0.0156, y0=60/1080=0.0556, dy=50/1080=0.0463, padding=10/1920=0.0052
-        
-        # 정규화된 좌표 (0~1 범위)
-        norm_x0, norm_y0, norm_dy, norm_padding = 0.0156, 0.0556, 0.0463, 0.0052
-        
-        # 출력 해상도에 맞게 스케일링
-        x0 = int(norm_x0 * output_width)
-        y0 = int(norm_y0 * output_height)
-        dy = int(norm_dy * output_height)
-        padding = int(norm_padding * output_width)
-        
-        # 폰트 크기도 출력 해상도에 맞게 스케일링
-        # 1920x1080 기준: font_scale=1, font_thickness=2
-        # 정규화: font_scale=1, font_thickness=2 (기본값 유지, 필요시 조정 가능)
-        base_font_scale = 1.0
-        base_font_thickness = 2
-        
-        # 출력 해상도에 따른 폰트 크기 조정 (1920x1080 기준으로 정규화)
-        scale_factor = min(output_width / 1920, output_height / 1080)
-        font_scale = base_font_scale * scale_factor
-        font_thickness = max(1, int(base_font_thickness * scale_factor))
-        
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        
-        max_width = 0
-        for txt in overlay:
-            (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
-            max_width = max(max_width, tw)
-        rect_x1, rect_y1 = x0 - padding, y0 - th - padding
-        rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
-        overlay_rect = annotated.copy()
-        cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
-        annotated = cv2.addWeighted(overlay_rect, 0.4, annotated, 0.6, 0)
-        for i, txt in enumerate(overlay):
-            cv2.putText(annotated, txt, (x0, y0 + i * dy),
-                        font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
-
-        # 히트맵 minimap (출력 해상도에 맞게 조정)
-        blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
-        norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-        color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
-
-        # 미니맵 크기를 출력 해상도에 맞게 조정 (0~1 정규화 좌표 사용)
-        # 1920x1080 기준: mini_w=400, margin=20
-        # 정규화: mini_w=400/1920=0.2083, margin=20/1920=0.0104
-        
-        # 정규화된 크기 (0~1 범위)
-        norm_mini_width = 0.2083  # 화면 너비의 20.83%
-        norm_margin = 0.0104      # 화면 너비의 1.04%
-        
-        # 출력 해상도에 맞게 스케일링
-        mini_w = int(norm_mini_width * output_width)
-        mini_h = int(output_height * mini_w / output_width)
-        margin = int(norm_margin * output_width)
-        
-        mini_map = cv2.resize(color_hm, (mini_w, mini_h))
-
-        # 미니맵 위치 계산 (우상단)
-        x_start = output_width - mini_w - margin
-        y_start = margin
-        
-        # 경계 체크
-        if x_start >= 0 and y_start >= 0 and x_start + mini_w <= output_width and y_start + mini_h <= output_height:
-            roi = annotated[y_start:y_start + mini_h, x_start:x_start + mini_w]
-            blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
-            annotated[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
+        # 히트맵 minimap 그리기
+        annotated = draw_heatmap_minimap(annotated, heatmap, output_width, output_height)
 
         # 중간 저장
         if frame_idx - updated_state['last_save_frame'] >= args.save_interval:
@@ -2391,19 +2245,14 @@ def main() -> None:
     output_video = os.path.join(output_dir, f"{base_name}_output.mp4")
 
     # 로그 파일 설정
-    log_file = None
     track_log_file = None
-    if args.log_detections:
-        log_path = os.path.join(output_dir, "label.txt")
-        log_file = open(log_path, "w", encoding="utf-8")
-        log_file.write("Frame_Time,Class,TrackID,Class_Count\n")
         
-        # 🎯 Track Result 로그 파일 설정
-        track_log_path = os.path.join(output_dir, "track_result.txt")
-        track_log_file = open(track_log_path, "w", encoding="utf-8")
-        
-        # 헤더 작성 (ROI 정보는 나중에 추가)
-        track_log_file.write("Frame_Time,Class,TrackID,cx,cy,width,height")
+    # 🎯 Track Result 로그 파일 설정
+    track_log_path = os.path.join(output_dir, "track_result.txt")
+    track_log_file = open(track_log_path, "w", encoding="utf-8")
+    
+    # 헤더 작성 (ROI 정보는 나중에 추가)
+    track_log_file.write("Frame_Time,Class,TrackID,cx,cy,width,height")
 
     # ─────────────── I/O setup ──────────────── #
     cap = cv2.VideoCapture(args.source)
@@ -2769,7 +2618,7 @@ def main() -> None:
                     forward_cnt, backward_cnt, current_occupancy, current_congestion,
                     last_update_time, heatmap, last_save_frame, log_buffer,
                     # I/O 관련
-                    output_dir, out, log_file, track_log_file, track_log_buffer,
+                    output_dir, out, track_log_file, track_log_buffer,
                     # 라인 크로싱 관련
                     p1, p2, p1_input, p2_input, seg_dx, seg_dy, seg_len2,
                     width, height, output_width, output_height, scale_x, scale_y,
@@ -2952,10 +2801,6 @@ def main() -> None:
 
     pbar.close()
     cap.release()
-    if log_file is not None:
-        if log_buffer:
-            log_file.writelines(log_buffer)
-        log_file.close()
     
     # 🎯 Track Result 로그 파일 정리
     if track_log_file is not None:

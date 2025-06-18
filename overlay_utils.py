@@ -454,4 +454,194 @@ def draw_detection_area(image, detection_area_polygon, scale_x=1.0, scale_y=1.0)
     except Exception as e:
         print(f"💥 기본 감지 영역 그리기 오류: {e}")
     
+    return image
+
+
+# ─────────────────────── Advanced Overlay Functions ────────────────────────────── #
+def update_heatmap(heatmap, tracked_objects, person_class_id, width, height):
+    """히트맵 업데이트"""
+    for obj in tracked_objects:
+        if obj.track_id == -1 or obj.class_id != person_class_id:
+            continue
+
+        x1, y1, x2, y2 = obj.box
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        ix, iy = int(cx), int(cy)
+        
+        # 히트맵 업데이트
+        if 0 <= iy < height and 0 <= ix < width:
+            radius = 10
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    if dx*dx + dy*dy <= radius*radius:
+                        ny, nx = iy + dy, ix + dx
+                        if 0 <= ny < height and 0 <= nx < width:
+                            intensity = 1.0 * (1.0 - ((dx*dx + dy*dy) / (radius*radius)))
+                            heatmap[ny, nx] += intensity
+    
+    return heatmap
+
+
+def check_line_crossing(tracked_objects, person_class_id, track_side, 
+                       p1_input, p2_input, seg_dx, seg_dy, seg_len2):
+    """라인 크로싱 체크 및 상태 업데이트"""
+    line_crossed_this_frame = False
+    forward_cnt_delta = 0
+    backward_cnt_delta = 0
+    
+    if p1_input is None or p2_input is None:
+        return line_crossed_this_frame, forward_cnt_delta, backward_cnt_delta
+    
+    # point_side 함수 정의 (로컬 함수)
+    def point_side(p, a, b):
+        """
+        Returns sign of point p relative to oriented line a->b.
+        +1 : left side, -1 : right side, 0 : on line
+        Using 2-D cross-product.
+        """
+        x, y = p
+        x1, y1 = a
+        x2, y2 = b
+        val = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
+        return 0 if val == 0 else (1 if val > 0 else -1)
+    
+    for obj in tracked_objects:
+        if obj.track_id == -1 or obj.class_id != person_class_id:
+            continue
+            
+        x1, y1, x2, y2 = obj.box
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        
+        # 라인 크로싱 체크 (입력 해상도 기준 좌표 사용)
+        side_now = point_side((cx, cy), p1_input, p2_input)
+        t = ((cx - p1_input[0]) * seg_dx + (cy - p1_input[1]) * seg_dy) / seg_len2
+        inside = 0.0 <= t <= 1.0
+
+        side_prev = track_side.get(obj.track_id, side_now)
+        if inside and (side_prev * side_now < 0):
+            line_crossed_this_frame = True
+            if side_prev < 0 < side_now:
+                forward_cnt_delta += 1
+            elif side_prev > 0 > side_now:
+                backward_cnt_delta += 1
+        if inside and side_now != 0:
+            track_side[obj.track_id] = side_now
+    
+    return line_crossed_this_frame, forward_cnt_delta, backward_cnt_delta
+
+
+def draw_counting_line(image, p1, p2, line_crossed_this_frame):
+    """라인 그리기 (출력 해상도에 맞게 스케일링)"""
+    if p1 is None or p2 is None:
+        return image
+        
+    line_thickness = 8
+    
+    if line_crossed_this_frame:
+        cv2.line(image, p1, p2, (255, 0, 0), line_thickness)
+    else:
+        cv2.line(image, p1, p2, (255, 255, 255), line_thickness)
+
+    mid_x, mid_y = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    perp_x, perp_y = -dy, dx
+    length = 50
+    mag = (perp_x**2 + perp_y**2) ** 0.5 or 1
+    perp_x, perp_y = int(perp_x / mag * length), int(perp_y / mag * length)
+    arrow_start, arrow_end = (mid_x, mid_y), (mid_x + perp_x, mid_y + perp_y)
+    cv2.arrowedLine(image, arrow_start, arrow_end, (0, 255, 0), line_thickness, tipLength=0.6)
+    
+    return image
+
+
+def draw_overlay_info(image, congestion, forward_cnt, backward_cnt, occupancy, 
+                     time_str, roi_manager, output_width, output_height):
+    """오버레이 정보 그리기"""
+    # Overlay 정보 그리기 (ROI 정보 추가)
+    overlay = [
+        f"[1] Congestion : {congestion:3d} %",
+        f"[2] Crossing   : forward {forward_cnt} | backward {backward_cnt}",
+        f"[3] Occupancy  : {occupancy}",
+        f"[4] Time      : {time_str}"
+    ]
+    
+    # ROI 접근 횟수 정보 추가
+    if roi_manager is not None:
+        for roi_name, roi_stat in roi_manager.roi_stats.items():
+            overlay.append(f"[ROI] {roi_name}: {roi_stat['total_access']} accesses")
+    
+    # 오버레이 텍스트 크기 (0~1 정규화 좌표를 출력 해상도에 맞게 스케일링)
+    # 1920x1080 기준: x0=30, y0=60, dy=50, padding=10
+    # 정규화: x0=30/1920=0.0156, y0=60/1080=0.0556, dy=50/1080=0.0463, padding=10/1920=0.0052
+    
+    # 정규화된 좌표 (0~1 범위)
+    norm_x0, norm_y0, norm_dy, norm_padding = 0.0156, 0.0556, 0.0463, 0.0052
+    
+    # 출력 해상도에 맞게 스케일링
+    x0 = int(norm_x0 * output_width)
+    y0 = int(norm_y0 * output_height)
+    dy = int(norm_dy * output_height)
+    padding = int(norm_padding * output_width)
+    
+    # 폰트 크기도 출력 해상도에 맞게 스케일링
+    # 1920x1080 기준: font_scale=1, font_thickness=2
+    # 정규화: font_scale=1, font_thickness=2 (기본값 유지, 필요시 조정 가능)
+    base_font_scale = 1.0
+    base_font_thickness = 2
+    
+    # 출력 해상도에 따른 폰트 크기 조정 (1920x1080 기준으로 정규화)
+    scale_factor = min(output_width / 1920, output_height / 1080)
+    font_scale = base_font_scale * scale_factor
+    font_thickness = max(1, int(base_font_thickness * scale_factor))
+    
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    max_width = 0
+    for txt in overlay:
+        (tw, th), _ = cv2.getTextSize(txt, font, font_scale, font_thickness)
+        max_width = max(max_width, tw)
+    rect_x1, rect_y1 = x0 - padding, y0 - th - padding
+    rect_x2, rect_y2 = x0 + max_width + padding, y0 + (len(overlay) - 1) * dy + padding
+    overlay_rect = image.copy()
+    cv2.rectangle(overlay_rect, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), -1)
+    image = cv2.addWeighted(overlay_rect, 0.4, image, 0.6, 0)
+    for i, txt in enumerate(overlay):
+        cv2.putText(image, txt, (x0, y0 + i * dy),
+                    font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+    
+    return image
+
+
+def draw_heatmap_minimap(image, heatmap, output_width, output_height):
+    """히트맵 미니맵 그리기 (출력 해상도에 맞게 조정)"""
+    blur = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=15, sigmaY=15)
+    norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    color_hm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+    color_hm = cv2.cvtColor(color_hm, cv2.COLOR_BGR2RGB)
+
+    # 미니맵 크기를 출력 해상도에 맞게 조정 (0~1 정규화 좌표 사용)
+    # 1920x1080 기준: mini_w=400, margin=20
+    # 정규화: mini_w=400/1920=0.2083, margin=20/1920=0.0104
+    
+    # 정규화된 크기 (0~1 범위)
+    norm_mini_width = 0.2083  # 화면 너비의 20.83%
+    norm_margin = 0.0104      # 화면 너비의 1.04%
+    
+    # 출력 해상도에 맞게 스케일링
+    mini_w = int(norm_mini_width * output_width)
+    mini_h = int(output_height * mini_w / output_width)
+    margin = int(norm_margin * output_width)
+    
+    mini_map = cv2.resize(color_hm, (mini_w, mini_h))
+
+    # 미니맵 위치 계산 (우상단)
+    x_start = output_width - mini_w - margin
+    y_start = margin
+    
+    # 경계 체크
+    if x_start >= 0 and y_start >= 0 and x_start + mini_w <= output_width and y_start + mini_h <= output_height:
+        roi = image[y_start:y_start + mini_h, x_start:x_start + mini_w]
+        blended = cv2.addWeighted(mini_map, 0.6, roi, 0.4, 0)
+        image[y_start:y_start + mini_h, x_start:x_start + mini_w] = blended
+    
     return image 
