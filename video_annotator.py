@@ -2393,8 +2393,9 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
                         obj_composite_key = (obj.class_id, obj.track_id)
                         for roi_name in roi_manager.roi_names:
                             access_status = 0
-                            if (obj.track_id in roi_access_info and 
-                                roi_name in roi_access_info[obj.track_id]):
+                            # 🔧 복합키로 일관되게 사용
+                            if (obj_composite_key in roi_access_info and 
+                                roi_name in roi_access_info[obj_composite_key]):
                                 access_status = 1
                             roi_values.append(str(access_status))
                         roi_access_str = ",".join(roi_values)
