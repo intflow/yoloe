@@ -138,8 +138,7 @@ def parse_args() -> argparse.Namespace:
                         help="Detection NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=1000,
                         help="Maximum number of detections per image")
-    parser.add_argument("--track-history", type=int, default=100,
-                        help="Frames kept in trajectory history")
+
     parser.add_argument("--track-det-thresh", type=float, default=0.2,
                         help="Detection confidence threshold for tracking")
     parser.add_argument("--track-iou-thresh", type=float, default=0.5,
@@ -165,9 +164,8 @@ def parse_args() -> argparse.Namespace:
                         help="Batch size for inference processing")
     parser.add_argument("--frame-loading-threads", type=int, default=32,
                         help="Number of threads for frame loading")
-    parser.add_argument("--vpe-momentum", type=float, default=0.1,
-                        help="VPE moving average momentum")
-    parser.add_argument("--limit-frame", type=int, default=999999,
+
+    parser.add_argument("--limit-frame", type=int, default=151,
                         help="Maximum number of frames to process")    
     # Image preprocessing
     parser.add_argument("--sharpen", type=float, default=0.0,
@@ -182,8 +180,7 @@ def parse_args() -> argparse.Namespace:
     # Reference Image & Label First
     parser.add_argument("--reference_img_path", type=str, default="reference",
                         help="Reference img file path")
-    parser.add_argument("--reference_label_path", type=str, default="reference",
-                        help="Reference label file path (JSON format)")
+
     
     # Confidence thresholds
     parser.add_argument("--high-conf-thresh", type=float, default=0.3,
@@ -1523,7 +1520,7 @@ class InferenceThread(threading.Thread):
         print(f"   - Inference Confidence Threshold: {args.conf_thresh}")
         print(f"   - VP Confidence Threshold: {args.vp_thresh}")
         print(f"   - Inference IoU Threshold: {args.iou_thresh}")
-        print(f"   - VPE 모멘텀: {args.vpe_momentum}")
+        
         print(f"\n📊 Confidence 기준:")
         print(f"   - conf >= {args.medium_conf_thresh}  : 정상 클래스 + 로깅 (≥0.1)")
         print(f"   - {args.very_low_conf_thresh}~{args.medium_conf_thresh}     : 저신뢰도 (원본 클래스 유지, tracker가 confidence로 구분)")
@@ -2412,7 +2409,7 @@ def preprocess_image(image, args):
 def process_batch_results(batch_detected_objects, batch_indices, batch_original_frames, 
                          tracker, args, fps, palette, person_class_id,
                          # 상태 변수들
-                         track_history, track_side, track_color, 
+                         track_side, track_color, 
                          forward_cnt, backward_cnt, current_occupancy, current_congestion,
                          last_update_time, heatmap, last_save_frame, log_buffer,
                          # I/O 관련
@@ -2810,13 +2807,6 @@ def process_batch_results(batch_detected_objects, batch_indices, batch_original_
 
 def main() -> None:
     args = parse_args()
-    # Hybrid VP 파라미터 (기본값 10, 10)
-    KEY_INT = getattr(args, 'key_int', 10)
-    HOLD_FR = getattr(args, 'hold', 10)
-    drift_max = HOLD_FR  # 연속 검출 실패시 리셋
-    drift_count = 0
-    
-    # object 클래스는 따로 만들지 않음 (저신뢰도 detection은 임시로 low_object로 처리)
 
     # 입력 파일 이름에서 확장자를 제외한 기본 이름 추출
     base_name = os.path.splitext(os.path.basename(args.source))[0]
@@ -3110,25 +3100,11 @@ def main() -> None:
         seg_dx = seg_dy = seg_len2 = 0
 
     # ─────────────── Runtime state ───────────── #
-    track_history = defaultdict(list)
     track_side   = {}
     track_color  = {}
     forward_cnt = backward_cnt = 0
 
-    # 트래킹 라인 관련 변수
-    max_track_history = 30  # 최대 트래킹 히스토리 길이
-    line_thickness = 2     # 라인 두께
-    line_opacity = 0.5     # 라인 투명도
 
-    # --- 프롬프트 반복 로직용 상태 변수 --- #
-    prev_prompt = None
-    prompt_frame = None
-    last_vp_frame = None
-    last_vp_results = None
-    
-    # VPE moving average 상태 변수
-    vpe_avg = None
-    vpe_alpha = 0.9  # moving average 계수 (0.9 = 이전 값의 90% + 현재 값의 10%)
 
     # Heat-map 누적 버퍼
     heatmap = np.zeros((height, width), dtype=np.float32)
@@ -3169,14 +3145,10 @@ def main() -> None:
         track_log_file.flush()
         print(f"📝 Track Result 로그 헤더 작성 완료")
 
-    # 라인 깜박임 상태
-    line_flash = False
-
     # 1초마다 갱신되는 값들
     last_update_time = 0
     current_occupancy = 0
     current_congestion = 0
-    frame_count = 0
 
     # 중간 저장 관련 변수
     last_save_frame = 0
@@ -3233,7 +3205,7 @@ def main() -> None:
                     batch_detected_objects, batch_indices, batch_original_frames,
                     tracker, args, fps, palette, person_class_id,
                     # 상태 변수들
-                    track_history, track_side, track_color, 
+                    track_side, track_color, 
                     forward_cnt, backward_cnt, current_occupancy, current_congestion,
                     last_update_time, heatmap, last_save_frame, log_buffer,
                     # I/O 관련
